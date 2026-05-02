@@ -6,90 +6,49 @@ const ENV={
   BYBIT_SECRET:process.env.BYBIT_SECRET_KEY||'',
   TG_TOKEN:process.env.TELEGRAM_TOKEN||'',
   TG_CHAT:process.env.TELEGRAM_CHAT_ID||'',
-  CLAUDE_KEY:process.env.CLAUDE_API_KEY||''
 };
 
-// 海馬策略設定（高頻短線）
 let cfg={
-  strategy:'SEAHORSE',
-  timeframe:'3m',
+  strategy:'SEAHORSE',timeframe:'3m',
   symbols:['BTCUSDT','ETHUSDT','SOLUSDT'],
-  tradeAmount:5,
-  leverage:5,
-  maxRiskPercent:10,
-  stopLossPercent:0.5,
-  takeProfitPercent:1.0,
-  atrSLMultiple:1.2,
-  atrTPMultiple:2.0,
-  allowShort:true,
-  botRunning:false,
-  maxPositions:3,
-  // 海馬策略專用參數
-  params:{
-    rsiPeriod:7,
-    oversold:25,
-    overbought:75,
-    volMultiple:1.8,
-    momentumPeriod:5,
-    bbPeriod:15,
-    bbStdDev:2
-  }
+  tradeAmount:5,leverage:5,maxRiskPercent:10,
+  stopLossPercent:0.5,takeProfitPercent:1.0,
+  atrSLMultiple:1.2,atrTPMultiple:2.0,
+  allowShort:true,botRunning:false,maxPositions:3,
+  params:{rsiPeriod:7,oversold:25,overbought:75,volMultiple:1.8,momentumPeriod:5,bbPeriod:15,bbStdDev:2}
 };
 
 let stats=loadStats();
-function loadStats(){
-  if(fs.existsSync('./bybit_stats.json'))try{return JSON.parse(fs.readFileSync('./bybit_stats.json','utf8'));}catch(e){}
-  return{allTime:{total:0,wins:0,losses:0,pnl:0},daily:{},trades:[]};
-}
+function loadStats(){if(fs.existsSync('./bybit_stats.json'))try{return JSON.parse(fs.readFileSync('./bybit_stats.json','utf8'));}catch(e){}return{allTime:{total:0,wins:0,losses:0,pnl:0},daily:{},trades:[]};}
 function saveStats(){fs.writeFileSync('./bybit_stats.json',JSON.stringify(stats,null,2));}
 function todayKey(){return new Date().toLocaleDateString('zh-TW',{timeZone:'Asia/Taipei'});}
 function nowTW(){return new Date().toLocaleString('zh-TW',{timeZone:'Asia/Taipei'});}
 function hourTW(){return parseInt(new Date().toLocaleString('en-US',{timeZone:'Asia/Taipei',hour:'numeric',hour12:false}));}
-function getDayStat(d){
-  d=d||todayKey();
-  if(!stats.daily[d])stats.daily[d]={total:0,wins:0,losses:0,pnl:0};
-  return stats.daily[d];
-}
+function getDayStat(d){d=d||todayKey();if(!stats.daily[d])stats.daily[d]={total:0,wins:0,losses:0,pnl:0};return stats.daily[d];}
 function recordTrade(t){
-  var d=getDayStat();
-  d.total++;if(t.pnl>0)d.wins++;else d.losses++;d.pnl+=t.pnl;
+  var d=getDayStat();d.total++;if(t.pnl>0)d.wins++;else d.losses++;d.pnl+=t.pnl;
   stats.allTime.total++;if(t.pnl>0)stats.allTime.wins++;else stats.allTime.losses++;stats.allTime.pnl+=t.pnl;
   stats.trades.push(Object.assign({},t,{date:todayKey()}));
   if(stats.trades.length>500)stats.trades=stats.trades.slice(-500);
-  saveStats();
-  learnFromTrade(t);
+  saveStats();learnFromTrade(t);
 }
 
-// 自我學習大腦
 let brain=loadBrain();
-function loadBrain(){
-  if(fs.existsSync('./bybit_brain.json'))try{return JSON.parse(fs.readFileSync('./bybit_brain.json','utf8'));}catch(e){}
-  return{
-    symbolPerf:{},hourPerf:{},errorPatterns:[],adjustHistory:[],learnCount:0,
-    bestHours:[],worstHours:[],bestSymbols:[],worstSymbols:[]
-  };
-}
+function loadBrain(){if(fs.existsSync('./bybit_brain.json'))try{return JSON.parse(fs.readFileSync('./bybit_brain.json','utf8'));}catch(e){}return{symbolPerf:{},hourPerf:{},errorPatterns:[],adjustHistory:[],learnCount:0,bestHours:[],worstHours:[],bestSymbols:[],worstSymbols:[]};}
 function saveBrain(){fs.writeFileSync('./bybit_brain.json',JSON.stringify(brain,null,2));}
 
 function learnFromTrade(t){
   brain.learnCount++;
   var symbol=t.symbol,pnl=t.pnl,holdMin=t.holdMin;
-  if(!brain.symbolPerf[symbol])brain.symbolPerf[symbol]={wins:0,losses:0,pnl:0,avgHold:0};
-  var sp=brain.symbolPerf[symbol];
-  if(pnl>0)sp.wins++;else sp.losses++;sp.pnl+=pnl;
-  sp.avgHold=((sp.avgHold*(sp.wins+sp.losses-1))+(holdMin||0))/(sp.wins+sp.losses);
+  if(!brain.symbolPerf[symbol])brain.symbolPerf[symbol]={wins:0,losses:0,pnl:0};
+  var sp=brain.symbolPerf[symbol];if(pnl>0)sp.wins++;else sp.losses++;sp.pnl+=pnl;
   var hr=String(hourTW());
   if(!brain.hourPerf[hr])brain.hourPerf[hr]={wins:0,losses:0,pnl:0};
-  var hp=brain.hourPerf[hr];
-  if(pnl>0)hp.wins++;else hp.losses++;hp.pnl+=pnl;
-  if(pnl<0){
-    brain.errorPatterns.push({symbol:symbol,pnl:pnl,holdMin:holdMin,hour:hourTW(),date:todayKey()});
-    if(brain.errorPatterns.length>100)brain.errorPatterns=brain.errorPatterns.slice(-100);
-  }
+  var hp=brain.hourPerf[hr];if(pnl>0)hp.wins++;else hp.losses++;hp.pnl+=pnl;
+  if(pnl<0){brain.errorPatterns.push({symbol:symbol,pnl:pnl,holdMin:holdMin,hour:hourTW(),date:todayKey()});if(brain.errorPatterns.length>100)brain.errorPatterns=brain.errorPatterns.slice(-100);}
   if(brain.learnCount%10===0)autoAdjust();
-  updateBestWorst();
-  saveBrain();
-  log('AI',pnl>0?'Learn: '+symbol+' profit +'+pnl.toFixed(2)+'U':'Learn: '+symbol+' loss '+pnl.toFixed(2)+'U');
+  updateBestWorst();saveBrain();
+  log('AI',pnl>0?symbol+' profit +'+pnl.toFixed(2)+'U':symbol+' loss '+pnl.toFixed(2)+'U');
 }
 
 function autoAdjust(){
@@ -101,58 +60,24 @@ function autoAdjust(){
   var avgLoss=losses.length?Math.abs(losses.reduce(function(s,t){return s+t.pnl;},0)/losses.length):0;
   var rr=avgLoss>0?avgWin/avgLoss:1;
   var changes=[];
-  // 海馬策略：勝率低時縮小止損
   if(wr<0.45&&cfg.stopLossPercent>0.3){var o=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.max(0.3,o-0.1)).toFixed(1);changes.push('SL '+o+'->'+cfg.stopLossPercent+'%');}
   if(wr>0.6&&cfg.stopLossPercent<1.0){var o2=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.min(1.0,o2+0.1)).toFixed(1);changes.push('SL '+o2+'->'+cfg.stopLossPercent+'%');}
-  // 盈虧比低時提高止盈
   if(rr<1.8&&cfg.takeProfitPercent<2.0){var o3=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.min(2.0,o3+0.1)).toFixed(1);changes.push('TP '+o3+'->'+cfg.takeProfitPercent+'%');}
-  // 平均持倉太短，放寬止損
-  var avgHold=recent.reduce(function(s,t){return s+(t.holdMin||0);},0)/recent.length;
-  if(avgHold<3&&cfg.stopLossPercent>0.3){cfg.stopLossPercent=+(cfg.stopLossPercent+0.1).toFixed(1);changes.push('SL放寬（持倉太短）');}
-  if(changes.length){
-    brain.adjustHistory.push({date:todayKey(),changes:changes,wr:(wr*100).toFixed(1),rr:rr.toFixed(2),avgHold:avgHold.toFixed(1)});
-    if(brain.adjustHistory.length>50)brain.adjustHistory=brain.adjustHistory.slice(-50);
-    log('AI','[Bybit] Auto adjust: '+changes.join(' | '));
-    tg('[Bybit] Auto Adjust\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'% RR:'+rr.toFixed(2)+' AvgHold:'+avgHold.toFixed(0)+'min');
-  }
+  if(changes.length){brain.adjustHistory.push({date:todayKey(),changes:changes,wr:(wr*100).toFixed(1),rr:rr.toFixed(2)});if(brain.adjustHistory.length>50)brain.adjustHistory=brain.adjustHistory.slice(-50);log('AI','Auto adjust: '+changes.join(' | '));tg('[Bybit海馬] Auto Adjust\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'% RR:'+rr.toFixed(2));}
 }
 
 function updateBestWorst(){
-  // 最佳時段
-  brain.bestHours=Object.keys(brain.hourPerf).filter(function(h){
-    var p=brain.hourPerf[h];var t=p.wins+p.losses;return t>=5&&p.wins/t>=0.6;
-  }).sort(function(a,b){return brain.hourPerf[b].pnl-brain.hourPerf[a].pnl;}).slice(0,3);
-  // 最差時段
-  brain.worstHours=Object.keys(brain.hourPerf).filter(function(h){
-    var p=brain.hourPerf[h];var t=p.wins+p.losses;return t>=5&&p.wins/t<0.4;
-  });
-  // 最佳品種
-  brain.bestSymbols=Object.keys(brain.symbolPerf).filter(function(s){
-    var p=brain.symbolPerf[s];var t=p.wins+p.losses;return t>=5&&p.wins/t>=0.55;
-  });
-  // 最差品種
-  brain.worstSymbols=Object.keys(brain.symbolPerf).filter(function(s){
-    var p=brain.symbolPerf[s];var t=p.wins+p.losses;return t>=5&&p.wins/t<0.35&&p.pnl<-10;
-  });
+  brain.bestHours=Object.keys(brain.hourPerf).filter(function(h){var p=brain.hourPerf[h];var t=p.wins+p.losses;return t>=5&&p.wins/t>=0.6;});
+  brain.worstHours=Object.keys(brain.hourPerf).filter(function(h){var p=brain.hourPerf[h];var t=p.wins+p.losses;return t>=5&&p.wins/t<0.4;});
+  brain.bestSymbols=Object.keys(brain.symbolPerf).filter(function(s){var p=brain.symbolPerf[s];var t=p.wins+p.losses;return t>=5&&p.wins/t>=0.55;});
+  brain.worstSymbols=Object.keys(brain.symbolPerf).filter(function(s){var p=brain.symbolPerf[s];var t=p.wins+p.losses;return t>=5&&p.wins/t<0.35&&p.pnl<-10;});
 }
 
-function isGoodHour(){
-  if(brain.bestHours.length===0)return true; // 還沒學到，都允許
-  var hr=String(hourTW());
-  if(brain.worstHours.includes(hr)){log('AI','差勁時段 '+hr+'時，跳過');return false;}
-  return true;
-}
+function isGoodHour(){var hr=String(hourTW());if(brain.worstHours.includes(hr)){log('AI','差勁時段跳過');return false;}return true;}
 
 var memLog=[];
-function log(lv,msg){
-  console.log('['+nowTW()+'][BY]['+lv+'] '+msg);
-  memLog.push({ts:nowTW(),lv:lv,msg:msg});
-  if(memLog.length>300)memLog.shift();
-}
+function log(lv,msg){console.log('['+nowTW()+'][BY]['+lv+'] '+msg);memLog.push({ts:nowTW(),lv:lv,msg:msg});if(memLog.length>300)memLog.shift();}
 
-// ═══════════════════════════════════════════════════
-// Bybit API（V5）
-// ═══════════════════════════════════════════════════
 function bybitSign(params,timestamp){
   var qs=timestamp+''+ENV.BYBIT_API_KEY+'5000'+params;
   return crypto.createHmac('sha256',ENV.BYBIT_SECRET).update(qs).digest('hex');
@@ -163,280 +88,127 @@ function bybitReq(method,path,params,tries){
   return new Promise(function(resolve,reject){
     var timestamp=Date.now();
     var qs=Object.keys(params).sort().map(function(k){return k+'='+encodeURIComponent(String(params[k]));}).join('&');
-    var sig=bybitSign(method==='GET'?qs:JSON.stringify(params),timestamp);
-    var headers={
-      'X-BAPI-API-KEY':ENV.BYBIT_API_KEY,
-      'X-BAPI-TIMESTAMP':String(timestamp),
-      'X-BAPI-SIGN':sig,
-      'X-BAPI-RECV-WINDOW':'5000',
-      'Content-Type':'application/json'
-    };
+    var body=method!=='GET'?JSON.stringify(params):'';
+    var sig=bybitSign(method==='GET'?qs:body,timestamp);
+    var headers={'X-BAPI-API-KEY':ENV.BYBIT_API_KEY,'X-BAPI-TIMESTAMP':String(timestamp),'X-BAPI-SIGN':sig,'X-BAPI-RECV-WINDOW':'5000','Content-Type':'application/json'};
     var reqPath=method==='GET'?path+(qs?'?'+qs:''):path;
     var opt={hostname:'api.bybit.com',path:reqPath,method:method,headers:headers};
     var go=function(n){
-      var req=https.request(opt,function(rsp){
-        var d='';rsp.on('data',function(c){d+=c;});
-        rsp.on('end',function(){try{resolve(JSON.parse(d));}catch(e){reject(new Error(d.slice(0,80)));}});
-      });
+      var req=https.request(opt,function(rsp){var d='';rsp.on('data',function(c){d+=c;});rsp.on('end',function(){try{resolve(JSON.parse(d));}catch(e){reject(new Error(d.slice(0,80)));}});});
       req.on('error',function(e){if(n>1)setTimeout(function(){go(n-1);},2000);else reject(e);});
       req.setTimeout(12000,function(){req.destroy();if(n>1)setTimeout(function(){go(n-1);},2000);else reject(new Error('Timeout'));});
-      if(method!=='GET')req.write(JSON.stringify(params));
-      req.end();
+      if(method!=='GET')req.write(body);req.end();
     };
     go(tries);
   });
 }
 
 async function getBalance(){
-  try{
-    var r=await bybitReq('GET','/v5/account/wallet-balance',{accountType:'UNIFIED'});
-    if(r.retCode===0){
-      var coins=r.result.list[0].coin;
-      var usdt=coins.find(function(c){return c.coin==='USDT';})||{};
-      return{available:parseFloat(usdt.availableToWithdraw||usdt.walletBalance||0),total:parseFloat(usdt.walletBalance||0),unrealPnl:parseFloat(usdt.unrealisedPnl||0)};
-    }
-  }catch(e){}
+  try{var r=await bybitReq('GET','/v5/account/wallet-balance',{accountType:'UNIFIED'});if(r.retCode===0){var coins=r.result.list[0].coin;var usdt=coins.find(function(c){return c.coin==='USDT';})||{};return{available:parseFloat(usdt.availableToWithdraw||usdt.walletBalance||0),total:parseFloat(usdt.walletBalance||0),unrealPnl:parseFloat(usdt.unrealisedPnl||0)};}}catch(e){}
   throw new Error('Cannot get Bybit balance');
 }
-
-async function getPositions(symbol){
-  try{
-    var p={category:'linear',settleCoin:'USDT'};
-    if(symbol)p.symbol=symbol;
-    var r=await bybitReq('GET','/v5/position/list',p);
-    if(r.retCode===0)return(r.result.list||[]).filter(function(p){return parseFloat(p.size||0)!==0;});
-  }catch(e){}
-  return[];
-}
-
-async function getKlines(symbol,interval,limit){
-  limit=limit||200;
-  try{
-    var r=await bybitReq('GET','/v5/market/kline',{category:'linear',symbol:symbol,interval:interval,limit:limit});
-    if(r.retCode===0)return r.result.list||[];
-  }catch(e){log('WARN','Kline fail '+symbol);}
-  return[];
-}
-
-async function getTicker(symbol){
-  try{
-    var r=await bybitReq('GET','/v5/market/tickers',{category:'linear',symbol:symbol});
-    if(r.retCode===0)return r.result.list[0];
-  }catch(e){}
-  return null;
-}
-
-async function setLeverage(symbol,leverage){
-  try{
-    await bybitReq('POST','/v5/position/set-leverage',{category:'linear',symbol:symbol,buyLeverage:String(leverage),sellLeverage:String(leverage)});
-  }catch(e){}
-}
+async function getPositions(symbol){try{var p={category:'linear',settleCoin:'USDT'};if(symbol)p.symbol=symbol;var r=await bybitReq('GET','/v5/position/list',p);if(r.retCode===0)return(r.result.list||[]).filter(function(p){return parseFloat(p.size||0)!==0;});}catch(e){}return[];}
+async function getKlines(symbol,interval,limit){limit=limit||200;try{var r=await bybitReq('GET','/v5/market/kline',{category:'linear',symbol:symbol,interval:interval,limit:limit});if(r.retCode===0)return r.result.list||[];}catch(e){log('WARN','Kline fail '+symbol);}return[];}
+async function getTicker(symbol){try{var r=await bybitReq('GET','/v5/market/tickers',{category:'linear',symbol:symbol});if(r.retCode===0)return r.result.list[0];}catch(e){}return null;}
+async function setLeverage(symbol,leverage){try{await bybitReq('POST','/v5/position/set-leverage',{category:'linear',symbol:symbol,buyLeverage:String(leverage),sellLeverage:String(leverage)});}catch(e){}}
 
 async function placeOrder(o){
   await setLeverage(o.symbol,cfg.leverage);
-  var params={
-    category:'linear',
-    symbol:o.symbol,
-    side:o.side,
-    orderType:'Market',
-    qty:String(o.quantity),
-    positionIdx:o.side==='Buy'?1:2
-  };
+  var params={category:'linear',symbol:o.symbol,side:o.side,orderType:'Market',qty:String(o.quantity),positionIdx:o.side==='Buy'?1:2};
   if(o.stopLoss)params.stopLoss=String(o.stopLoss);
   if(o.takeProfit)params.takeProfit=String(o.takeProfit);
   log('INFO','Order '+o.side+' '+o.symbol+' x'+o.quantity);
   var r=await bybitReq('POST','/v5/order/create',params);
-  if(r.retCode===0){
-    log('OK','Order OK '+o.side+' '+o.symbol+' ID:'+r.result.orderId);
-    tg('[Bybit] Order OK\n'+(o.side==='Buy'?'LONG':'SHORT')+' '+o.symbol+'\nQty:'+o.quantity+'\nSL:'+( o.stopLoss||'-')+' TP:'+(o.takeProfit||'-'));
-    return r.result;
-  }else{
-    log('ERROR','Order FAIL ['+r.retCode+'] '+r.retMsg);
-    tg('[Bybit] Order FAIL '+o.symbol+'\n['+r.retCode+'] '+r.retMsg);
-    return null;
-  }
+  if(r.retCode===0){log('OK','Order OK '+o.side+' '+o.symbol);tg('[Bybit海馬] 下單成功\n'+(o.side==='Buy'?'LONG':'SHORT')+' '+o.symbol+'\nQty:'+o.quantity+'\nSL:'+(o.stopLoss||'-')+' TP:'+(o.takeProfit||'-'));return r.result;}
+  else{log('ERROR','Order FAIL ['+r.retCode+'] '+r.retMsg);tg('[Bybit海馬] 下單失敗 '+o.symbol+'\n['+r.retCode+'] '+r.retMsg);return null;}
 }
+async function closePosition(symbol,side,qty){return placeOrder({symbol:symbol,side:side==='Buy'?'Sell':'Buy',quantity:qty,positionIdx:side==='Buy'?1:2});}
 
-async function closePosition(symbol,side,qty){
-  var closeSide=side==='Buy'?'Sell':'Buy';
-  return placeOrder({symbol:symbol,side:closeSide,quantity:qty,positionIdx:side==='Buy'?1:2});
-}
-
-// ═══════════════════════════════════════════════════
-// 海馬策略指標
-// ═══════════════════════════════════════════════════
 var I={
   ma:function(a,n){if(a.length<n)return null;return a.slice(-n).reduce(function(s,v){return s+v;},0)/n;},
   ema:function(a,n){if(a.length<n)return null;var k=2/(n+1);var e=a.slice(0,n).reduce(function(s,v){return s+v;},0)/n;for(var i=n;i<a.length;i++)e=a[i]*k+e*(1-k);return e;},
   rsi:function(a,n){n=n||14;if(a.length<n+1)return null;var g=0,l=0;for(var i=a.length-n;i<a.length;i++){var d=a[i]-a[i-1];if(d>0)g+=d;else l-=d;}return 100-100/(1+g/(l||0.0001));},
-  boll:function(a,n,d){n=n||20;d=d||2;if(a.length<n)return null;var sl=a.slice(-n),m=sl.reduce(function(s,v){return s+v;},0)/n,std=Math.sqrt(sl.reduce(function(s,v){return s+Math.pow(v-m,2);},0)/n);return{upper:m+d*std,mid:m,lower:m-d*std,std:std};},
+  boll:function(a,n,d){n=n||20;d=d||2;if(a.length<n)return null;var sl=a.slice(-n),m=sl.reduce(function(s,v){return s+v;},0)/n,std=Math.sqrt(sl.reduce(function(s,v){return s+Math.pow(v-m,2);},0)/n);return{upper:m+d*std,mid:m,lower:m-d*std};},
   atr:function(h,l,c,n){n=n||14;if(c.length<n+1)return null;var tr=[];for(var i=1;i<c.length;i++)tr.push(Math.max(h[i]-l[i],Math.abs(h[i]-c[i-1]),Math.abs(l[i]-c[i-1])));return tr.slice(-n).reduce(function(s,v){return s+v;},0)/n;},
-  // 動能指標
   momentum:function(a,n){n=n||5;if(a.length<n+1)return null;return(a[a.length-1]-a[a.length-1-n])/a[a.length-1-n]*100;}
 };
 
-// ═══════════════════════════════════════════════════
-// 海馬策略核心（高頻短線）
-// ═══════════════════════════════════════════════════
 async function runSeahorse(sym){
-  // 跳過差勁時段
   if(!isGoodHour())return null;
-  // 跳過表現差的品種
-  if(brain.worstSymbols.includes(sym)){log('AI',sym+' 績效差暫時跳過');return null;}
-
-  var kl=await getKlines(sym,cfg.timeframe,100);
-  if(kl.length<50)return null;
-
-  // Bybit K線格式：[timestamp,open,high,low,close,volume,turnover]
+  if(brain.worstSymbols.includes(sym)){log('AI',sym+' 績效差跳過');return null;}
+  var kl=await getKlines(sym,cfg.timeframe,100);if(kl.length<50)return null;
   var closes=kl.map(function(k){return parseFloat(k[4]);}).reverse();
   var highs=kl.map(function(k){return parseFloat(k[2]);}).reverse();
   var lows=kl.map(function(k){return parseFloat(k[3]);}).reverse();
   var vols=kl.map(function(k){return parseFloat(k[5]);}).reverse();
-  var last=closes[closes.length-1];
-  var p=cfg.params;
-
+  var last=closes[closes.length-1],p=cfg.params;
   var bs=0,ss=0,rsn=[];
-
-  // 1. RSI 超買超賣（海馬核心）
-  var rsi=I.rsi(closes,p.rsiPeriod||7);
-  var rsiPrev=I.rsi(closes.slice(0,-1),p.rsiPeriod||7);
-  if(rsi&&rsiPrev){
-    if(rsiPrev<(p.oversold||25)&&rsi>(p.oversold||25)){bs+=3;rsn.push('RSI超賣回升('+rsi.toFixed(0)+')');}
-    if(rsiPrev>(p.overbought||75)&&rsi<(p.overbought||75)){ss+=3;rsn.push('RSI超買回落('+rsi.toFixed(0)+')');}
-    if(rsi<35)bs++;if(rsi>65)ss++;
-  }
-
-  // 2. 成交量放大確認（海馬必要條件）
-  var avgVol=I.ma(vols.slice(0,-1),20);
-  var curVol=vols[vols.length-1];
-  if(avgVol&&curVol>avgVol*(p.volMultiple||1.8)){
-    bs++;ss++;rsn.push('量增'+(curVol/avgVol).toFixed(1)+'x');
-  }else{
-    // 沒有量能，降低訊號強度
-    bs=Math.max(0,bs-1);ss=Math.max(0,ss-1);
-  }
-
-  // 3. 布林通道位置
+  var rsi=I.rsi(closes,p.rsiPeriod||7),rsiPrev=I.rsi(closes.slice(0,-1),p.rsiPeriod||7);
+  if(rsi&&rsiPrev){if(rsiPrev<(p.oversold||25)&&rsi>(p.oversold||25)){bs+=3;rsn.push('RSI超賣('+rsi.toFixed(0)+')');}if(rsiPrev>(p.overbought||75)&&rsi<(p.overbought||75)){ss+=3;rsn.push('RSI超買('+rsi.toFixed(0)+')');}if(rsi<35)bs++;if(rsi>65)ss++;}
+  var avgVol=I.ma(vols.slice(0,-1),20),curVol=vols[vols.length-1];
+  if(avgVol&&curVol>avgVol*(p.volMultiple||1.8)){bs++;ss++;rsn.push('量增'+(curVol/avgVol).toFixed(1)+'x');}else{bs=Math.max(0,bs-1);ss=Math.max(0,ss-1);}
   var bb=I.boll(closes,p.bbPeriod||15,p.bbStdDev||2);
-  if(bb){
-    if(last<bb.lower){bs+=2;rsn.push('BB下軌');}
-    if(last>bb.upper){ss+=2;rsn.push('BB上軌');}
-    // 布林中軌方向
-    var bbMidPrev=I.boll(closes.slice(0,-1),p.bbPeriod||15,p.bbStdDev||2);
-    if(bbMidPrev){
-      if(bb.mid>bbMidPrev.mid)bs++;
-      if(bb.mid<bbMidPrev.mid)ss++;
-    }
-  }
-
-  // 4. 短期動能
+  if(bb){if(last<bb.lower){bs+=2;rsn.push('BB下軌');}if(last>bb.upper){ss+=2;rsn.push('BB上軌');}}
   var mom=I.momentum(closes,p.momentumPeriod||5);
-  if(mom!==null){
-    if(mom>0.3){bs++;rsn.push('動能+');}
-    if(mom<-0.3){ss++;rsn.push('動能-');}
-  }
-
-  // 5. K線實體方向（最後兩根）
-  var body1=closes[closes.length-1]-parseFloat(kl[0][1]); // 最新K線
-  var body2=closes[closes.length-2]-parseFloat(kl[1][1]); // 前一根
-  if(body1>0&&body2>0){bs++;rsn.push('連續紅K');}
-  if(body1<0&&body2<0){ss++;rsn.push('連續黑K');}
-
-  // 海馬策略門檻：需要4分才進場
-  var signal='HOLD';
-  if(bs>=4||ss>=4)signal=bs>=ss?'BUY':'SELL';
-
+  if(mom!==null){if(mom>0.3){bs++;rsn.push('動能+');}if(mom<-0.3){ss++;rsn.push('動能-');}}
+  var signal='HOLD';if(bs>=4||ss>=4)signal=bs>=ss?'BUY':'SELL';
   var atrV=I.atr(highs,lows,closes)||last*0.005;
-  return{signal:signal,reasons:rsn.join('+'),price:last,atrV:atrV,bs:bs,ss:ss};
+  return{signal:signal,reasons:rsn.join('+'),price:last,atrV:atrV};
 }
 
-// ═══════════════════════════════════════════════════
-// 主交易循環
-// ═══════════════════════════════════════════════════
-var openTrades={};
-var botTimer=null,startTime=Date.now();
+var openTrades={},botTimer=null,startTime=Date.now();
 
 async function tradingLoop(){
   if(!cfg.botRunning)return;
-  log('INFO','--- Bybit 海馬循環 '+nowTW()+' ---');
-
-  // 檢查持倉數量限制
+  log('INFO','--- 海馬循環 '+nowTW()+' ---');
   var posCount=Object.keys(openTrades).length;
-  if(posCount>=cfg.maxPositions){
-    log('INFO','已達最大持倉數 '+cfg.maxPositions+'，等待平倉');
-    await checkExistingPositions();
-    return;
-  }
-
+  if(posCount>=cfg.maxPositions){await checkPositions();return;}
   for(var i=0;i<cfg.symbols.length;i++){
     var sym=cfg.symbols[i];
     try{
-      var res=await runSeahorse(sym);
-      if(!res)continue;
+      var res=await runSeahorse(sym);if(!res)continue;
       var signal=res.signal,reasons=res.reasons,price=res.price,atrV=res.atrV;
-      var tk=await getTicker(sym);
-      var cur=tk?parseFloat(tk.lastPrice):price;
+      var tk=await getTicker(sym);var cur=tk?parseFloat(tk.lastPrice):price;
       log('INFO',sym+' '+cur.toFixed(4)+' '+signal+(reasons?' | '+reasons:''));
       if(signal==='HOLD')continue;
-
-      var bal=await getBalance();
-      var amt=Math.min(cfg.tradeAmount,bal.available*(cfg.maxRiskPercent/100));
+      var bal=await getBalance();var amt=Math.min(cfg.tradeAmount,bal.available*(cfg.maxRiskPercent/100));
       if(amt<1){log('WARN',sym+' 餘額不足');continue;}
-
       var qty=parseFloat((amt*cfg.leverage/cur).toFixed(4));if(qty<=0)continue;
-
       var slD=Math.max(atrV*cfg.atrSLMultiple,cur*cfg.stopLossPercent/100);
       var tpD=Math.max(atrV*cfg.atrTPMultiple,cur*cfg.takeProfitPercent/100);
       var slP=signal==='BUY'?+(cur-slD).toFixed(4):+(cur+slD).toFixed(4);
       var tpP=signal==='BUY'?+(cur+tpD).toFixed(4):+(cur-tpD).toFixed(4);
-
       var pos=await getPositions(sym);
-      var hasLong=pos.some(function(p){return p.side==='Buy';});
-      var hasShort=pos.some(function(p){return p.side==='Sell';});
-
-      if(signal==='BUY'&&!hasLong&&!openTrades[sym+'_L']){
-        log('BUY','開多 '+sym+' x'+qty+' 入:'+cur.toFixed(4));
+      if(signal==='BUY'&&!pos.some(function(p){return p.side==='Buy';})&&!openTrades[sym+'_L']){
         var o=await placeOrder({symbol:sym,side:'Buy',quantity:qty,stopLoss:slP,takeProfit:tpP});
-        if(o)openTrades[sym+'_L']={symbol:sym,side:'Buy',entry:cur,qty:qty,sl:slP,tp:tpP,reason:reasons,openTime:Date.now()};
+        if(o)openTrades[sym+'_L']={symbol:sym,side:'Buy',entry:cur,qty:qty,reason:reasons,openTime:Date.now()};
       }
-      if(signal==='SELL'&&cfg.allowShort&&!hasShort&&!openTrades[sym+'_S']){
-        log('SELL','開空 '+sym+' x'+qty+' 入:'+cur.toFixed(4));
+      if(signal==='SELL'&&cfg.allowShort&&!pos.some(function(p){return p.side==='Sell';})&&!openTrades[sym+'_S']){
         var o2=await placeOrder({symbol:sym,side:'Sell',quantity:qty,stopLoss:slP,takeProfit:tpP});
-        if(o2)openTrades[sym+'_S']={symbol:sym,side:'Sell',entry:cur,qty:qty,sl:slP,tp:tpP,reason:reasons,openTime:Date.now()};
+        if(o2)openTrades[sym+'_S']={symbol:sym,side:'Sell',entry:cur,qty:qty,reason:reasons,openTime:Date.now()};
       }
     }catch(e){log('ERROR',sym+': '+e.message);}
   }
-
-  await checkExistingPositions();
+  await checkPositions();
 }
 
-async function checkExistingPositions(){
+async function checkPositions(){
   for(var key in openTrades){
-    var t=openTrades[key];
-    var tk=await getTicker(t.symbol).catch(function(){return null;});
-    if(!tk)continue;
-    var cur=parseFloat(tk.lastPrice);
+    var t=openTrades[key];var tk=await getTicker(t.symbol).catch(function(){return null;});if(!tk)continue;
+    var cur=parseFloat(tk.lastPrice);var holdMin=Math.round((Date.now()-t.openTime)/60000);
     var pnl=t.side==='Buy'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;
-    var holdMin=Math.round((Date.now()-t.openTime)/60000);
-    var pnlPct=t.side==='Buy'?(cur-t.entry)/t.entry*100:(t.entry-cur)/t.entry*100;
-
-    // 海馬策略：超過30分鐘強制平倉（避免隔夜風險）
     if(holdMin>=30){
-      log('WARN','超時平倉 '+t.symbol+' 持'+holdMin+'分 PnL:'+pnl.toFixed(2)+'U');
       var o=await closePosition(t.symbol,t.side,t.qty).catch(function(){return null;});
-      if(o){recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl,holdMin:holdMin,reason:'超時'});delete openTrades[key];tg('[Bybit] 超時平倉 '+t.symbol+'\nPnL:'+(pnl>=0?'+':'')+pnl.toFixed(2)+'U Hold:'+holdMin+'min');}
+      if(o){recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl,holdMin:holdMin,reason:'超時'});delete openTrades[key];tg('[Bybit海馬] 超時平倉 '+t.symbol+'\nPnL:'+(pnl>=0?'+':'')+pnl.toFixed(2)+'U Hold:'+holdMin+'min');}
     }
   }
 }
 
-// ═══════════════════════════════════════════════════
-// Telegram
-// ═══════════════════════════════════════════════════
 function tg(text,chatId){
   var id=chatId||ENV.TG_CHAT;if(!ENV.TG_TOKEN||!id)return;
   var body=JSON.stringify({chat_id:id,text:text,parse_mode:'HTML'});
   var req=https.request({hostname:'api.telegram.org',path:'/bot'+ENV.TG_TOKEN+'/sendMessage',method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}},function(r){var d='';r.on('data',function(c){d+=c;});});
-  req.on('error',function(e){});req.write(body);req.end();
+  req.on('error',function(){});req.write(body);req.end();
 }
 
 var lastUpdateId=0;
@@ -459,94 +231,90 @@ function handleUpdate(update){
   var chatId=String(msg.chat.id),text=(msg.text||'').trim();
   if(ENV.TG_CHAT&&chatId!==ENV.TG_CHAT){tg('Unauthorized',chatId);return;}
   var parts=text.split(' '),cmd=parts[0].toLowerCase(),args=parts.slice(1);
-  // 只處理 /by 前綴的指令
-  if(!cmd.startsWith('/by')&&cmd!=='/byhelp')return;
-  var subcmd=cmd.replace('/by','/')||'/help';
 
-  if(subcmd==='/help'||subcmd==='/'){
-    tg('[Bybit 海馬策略]\n\n/bygo - 啟動\n/bystop - 停止\n/bystatus - 狀態\n/bypositions - 持倉\n/bybrain - 學習狀態\n/bystats - 績效\n/byset amount 5\n/byset leverage 5\n/byset sl 0.5\n/byset tp 1\n/byset tf 3m\n/byaddsym SOLUSDT\n/bydelsym AAPL',chatId);return;
+  if(cmd==='/start'||cmd==='/help'){
+    tg('Bybit 海馬策略 AutoTrader v1.0\nSelf-Learning ON\n\n/go - 啟動\n/stop - 停止\n/status - 狀態\n/positions - 持倉\n/brain - 學習狀態\n/stats - 績效\n/history - 近10筆\n/set amount 5\n/set leverage 5\n/set sl 0.5\n/set tp 1.0\n/set tf 3m\n/addsym SOLUSDT\n/delsym SOLUSDT',chatId);return;
   }
-  if(subcmd==='/go'){
-    if(cfg.botRunning){tg('[Bybit] Already running',chatId);return;}
+  if(cmd==='/go'){
+    if(cfg.botRunning){tg('Already running',chatId);return;}
     cfg.botRunning=true;
     var ms={'1m':60000,'3m':180000,'5m':300000}[cfg.timeframe]||180000;
     botTimer=setInterval(tradingLoop,ms);tradingLoop();
-    tg('[Bybit] 海馬策略啟動!\nTF:'+cfg.timeframe+' Lev:'+cfg.leverage+'x\nAmt:'+cfg.tradeAmount+'U SL:'+cfg.stopLossPercent+'% TP:'+cfg.takeProfitPercent+'%\nSymbols:'+cfg.symbols.join(',')+'\nSelf-Learning: ON',chatId);return;
+    tg('Bybit 海馬策略啟動!\nTF:'+cfg.timeframe+' Lev:'+cfg.leverage+'x\nAmt:'+cfg.tradeAmount+'U SL:'+cfg.stopLossPercent+'% TP:'+cfg.takeProfitPercent+'%\nSymbols:'+cfg.symbols.join(',')+'\nSelf-Learning: ON',chatId);return;
   }
-  if(subcmd==='/stop'){cfg.botRunning=false;clearInterval(botTimer);botTimer=null;tg('[Bybit] Stopped',chatId);return;}
-  if(subcmd==='/status'){
+  if(cmd==='/stop'){cfg.botRunning=false;clearInterval(botTimer);botTimer=null;tg('Stopped',chatId);return;}
+  if(cmd==='/status'){
     getBalance().then(function(bal){
       var d=getDayStat(),all=stats.allTime;
-      tg('[Bybit 海馬]\n'+(cfg.botRunning?'RUNNING':'STOPPED')+' Uptime:'+Math.round((Date.now()-startTime)/60000)+'min\nBalance:'+bal.available.toFixed(2)+'U\nToday:'+d.total+' WR:'+(d.total>0?(d.wins/d.total*100).toFixed(0):0)+'% PnL:'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'U\nAll:'+all.total+' WR:'+(all.total>0?(all.wins/all.total*100).toFixed(0):0)+'% PnL:'+(all.pnl>=0?'+':'')+all.pnl.toFixed(2)+'U\nLearned:'+brain.learnCount+'\nPositions:'+Object.keys(openTrades).length,chatId);
-    }).catch(function(e){tg('[Bybit] Error: '+e.message,chatId);});return;
+      tg('[Bybit 海馬]\n'+(cfg.botRunning?'RUNNING':'STOPPED')+' Uptime:'+Math.round((Date.now()-startTime)/60000)+'min\nBalance:'+bal.available.toFixed(2)+'U Total:'+bal.total.toFixed(2)+'U\nToday:'+d.total+' WR:'+(d.total>0?(d.wins/d.total*100).toFixed(0):0)+'% PnL:'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'U\nAll:'+all.total+' WR:'+(all.total>0?(all.wins/all.total*100).toFixed(0):0)+'% PnL:'+(all.pnl>=0?'+':'')+all.pnl.toFixed(2)+'U\nLearned:'+brain.learnCount+'\nPositions:'+Object.keys(openTrades).length,chatId);
+    }).catch(function(e){tg('Error: '+e.message,chatId);});return;
   }
-  if(subcmd==='/brain'){
-    var bestH=brain.bestHours.length?brain.bestHours.join(','):'學習中';
-    var worstH=brain.worstHours.length?brain.worstHours.join(','):'無';
+  if(cmd==='/brain'){
+    var bestH=brain.bestHours.length?brain.bestHours.join(',')+'時':'學習中';
+    var worstH=brain.worstHours.length?brain.worstHours.join(',')+'時':'無';
     var bestS=brain.bestSymbols.length?brain.bestSymbols.join(','):'學習中';
     var worstS=brain.worstSymbols.length?brain.worstSymbols.join(','):'無';
-    tg('[Bybit] 海馬學習狀態\nLearned:'+brain.learnCount+'\n最佳時段: '+bestH+'時\n迴避時段: '+worstH+'時\n最佳品種: '+bestS+'\n迴避品種: '+worstS+'\n調參次數: '+brain.adjustHistory.length,chatId);return;
+    tg('[Bybit] 海馬學習狀態\nLearned:'+brain.learnCount+'\n最佳時段: '+bestH+'\n迴避時段: '+worstH+'\n最佳品種: '+bestS+'\n迴避品種: '+worstS+'\n調參次數: '+brain.adjustHistory.length,chatId);return;
   }
-  if(subcmd==='/positions'){
+  if(cmd==='/positions'){
     var keys=Object.keys(openTrades);if(!keys.length){tg('[Bybit] 無持倉',chatId);return;}
     Promise.all(keys.map(function(k){return getTicker(openTrades[k].symbol).catch(function(){return null;});})).then(function(tks){
-      var m='[Bybit] 持倉\n\n';
-      keys.forEach(function(k,i){var t=openTrades[k],cur=tks[i]?parseFloat(tks[i].lastPrice):t.entry,pnl=t.side==='Buy'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;m+=t.symbol+' '+(t.side==='Buy'?'多':'空')+'\nEntry:'+t.entry.toFixed(4)+' Now:'+cur.toFixed(4)+'\nPnL:'+(pnl>=0?'+':'')+pnl.toFixed(2)+'U Hold:'+Math.round((Date.now()-t.openTime)/60000)+'min\n\n';});
-      tg(m,chatId);});return;
+      var m='[Bybit] 持倉\n\n';keys.forEach(function(k,i){var t=openTrades[k],cur=tks[i]?parseFloat(tks[i].lastPrice):t.entry,pnl=t.side==='Buy'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;m+=t.symbol+' '+(t.side==='Buy'?'多':'空')+'\nEntry:'+t.entry.toFixed(4)+' Now:'+cur.toFixed(4)+'\nPnL:'+(pnl>=0?'+':'')+pnl.toFixed(2)+'U Hold:'+Math.round((Date.now()-t.openTime)/60000)+'min\n\n';});tg(m,chatId);});return;
   }
-  if(subcmd==='/stats'){
+  if(cmd==='/stats'){
     var al=stats.allTime,dds=getDayStat();var w7='',p7=0;
     for(var i=6;i>=0;i--){var dd=new Date();dd.setDate(dd.getDate()-i);var dk=dd.toLocaleDateString('zh-TW',{timeZone:'Asia/Taipei'});var ds=getDayStat(dk);p7+=ds.pnl;w7+=dk.slice(5)+':'+ds.total+'x '+(ds.pnl>=0?'+':'')+ds.pnl.toFixed(0)+'U\n';}
     tg('[Bybit] Stats\nToday:'+dds.total+' WR:'+(dds.total>0?(dds.wins/dds.total*100).toFixed(0):0)+'% PnL:'+(dds.pnl>=0?'+':'')+dds.pnl.toFixed(2)+'U\n7days:\n'+w7+'All:'+al.total+' WR:'+(al.total>0?(al.wins/al.total*100).toFixed(1):0)+'% PnL:'+(al.pnl>=0?'+':'')+al.pnl.toFixed(2)+'U',chatId);return;
   }
-  if(subcmd==='/set'){
-    if(args.length<2){tg('Usage: /byset KEY VALUE',chatId);return;}
+  if(cmd==='/history'){
+    var tr=stats.trades.slice(-10).reverse();if(!tr.length){tg('No trades',chatId);return;}
+    tg('[Bybit] Last 10\n'+tr.map(function(t){return (t.pnl>=0?'WIN':'LOSS')+' '+t.symbol+'\n'+(t.entry||0).toFixed(4)+'->'+(t.exit||0).toFixed(4)+' '+(t.pnl>=0?'+':'')+t.pnl.toFixed(2)+'U hold:'+(t.holdMin||0)+'m';}).join('\n'),chatId);return;
+  }
+  if(cmd==='/set'){
+    if(args.length<2){tg('Usage: /set KEY VALUE',chatId);return;}
     var sk=args[0].toLowerCase(),sv=args[1],nv=parseFloat(sv);
-    if(sk==='amount'&&nv>0){cfg.tradeAmount=nv;tg('[Bybit] Amount -> '+nv+'U',chatId);}
-    else if(sk==='leverage'&&nv>=1&&nv<=20){cfg.leverage=nv;tg('[Bybit] Leverage -> '+nv+'x',chatId);}
-    else if(sk==='sl'&&nv>0){cfg.stopLossPercent=nv;tg('[Bybit] SL -> '+nv+'%',chatId);}
-    else if(sk==='tp'&&nv>0){cfg.takeProfitPercent=nv;tg('[Bybit] TP -> '+nv+'%',chatId);}
-    else if(sk==='tf'){if(['1m','3m','5m'].includes(sv)){cfg.timeframe=sv;tg('[Bybit] TF -> '+sv,chatId);}else tg('只支援 1m 3m 5m',chatId);}
+    if(sk==='amount'&&nv>0){cfg.tradeAmount=nv;tg('Amount -> '+nv+'U',chatId);}
+    else if(sk==='leverage'&&nv>=1&&nv<=20){cfg.leverage=nv;tg('Leverage -> '+nv+'x',chatId);}
+    else if(sk==='sl'&&nv>0){cfg.stopLossPercent=nv;tg('SL -> '+nv+'%',chatId);}
+    else if(sk==='tp'&&nv>0){cfg.takeProfitPercent=nv;tg('TP -> '+nv+'%',chatId);}
+    else if(sk==='tf'){if(['1m','3m','5m'].includes(sv)){cfg.timeframe=sv;tg('TF -> '+sv,chatId);}else tg('只支援 1m 3m 5m',chatId);}
     else tg('Unknown: '+sk,chatId);return;
   }
-  if(subcmd==='/addsym'){if(!args[0]){tg('Usage: /byaddsym SOLUSDT',chatId);return;}var as=args[0].toUpperCase();if(cfg.symbols.includes(as)){tg(as+' exists',chatId);return;}cfg.symbols.push(as);tg('[Bybit] Added '+as,chatId);return;}
-  if(subcmd==='/delsym'){if(!args[0]){tg('Usage: /bydelsym SOLUSDT',chatId);return;}cfg.symbols=cfg.symbols.filter(function(s){return s!==args[0].toUpperCase();});tg('[Bybit] Removed '+args[0].toUpperCase(),chatId);return;}
+  if(cmd==='/addsym'){if(!args[0]){tg('Usage: /addsym SOLUSDT',chatId);return;}var as=args[0].toUpperCase();if(cfg.symbols.includes(as)){tg(as+' exists',chatId);return;}cfg.symbols.push(as);tg('Added '+as,chatId);return;}
+  if(cmd==='/delsym'){if(!args[0]){tg('Usage: /delsym SOLUSDT',chatId);return;}cfg.symbols=cfg.symbols.filter(function(s){return s!==args[0].toUpperCase();});tg('Removed '+args[0].toUpperCase(),chatId);return;}
+  if(text.startsWith('/'))tg('Unknown. Use /help',chatId);
 }
 
 function startServer(){
   var PORT=process.env.BYBIT_PORT||3001;
   http.createServer(function(req,res){
     res.writeHead(200,{'Content-Type':'application/json'});
-    res.end(JSON.stringify({status:'ok',name:'bybit-seahorse',running:cfg.botRunning,learnCount:brain.learnCount,uptime:Math.round((Date.now()-startTime)/60000)+'min',trades:stats.allTime.total,pnl:stats.allTime.pnl.toFixed(2)}));
+    res.end(JSON.stringify({status:'ok',name:'bybit-seahorse',running:cfg.botRunning,learnCount:brain.learnCount,uptime:Math.round((Date.now()-startTime)/60000)+'min'}));
   }).listen(PORT,function(){log('OK','Bybit Server Port:'+PORT);});
 }
 
 function scheduleReport(){
   function ms10(){var now=new Date(),tw=new Date(now.toLocaleString('en-US',{timeZone:'Asia/Taipei'}));var n=new Date(tw);n.setHours(10,0,0,0);if(tw.getHours()>=10)n.setDate(n.getDate()+1);return n-tw;}
-  var ms=ms10();log('AI','Report in '+(ms/3600000).toFixed(1)+'h');
   setTimeout(function(){
     var d=getDayStat(),all=stats.allTime;
-    tg('[Bybit 海馬] 每日報告\n今日:'+d.total+'次 WR:'+(d.total>0?(d.wins/d.total*100).toFixed(1):0)+'% PnL:'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'U\n最佳時段:'+( brain.bestHours.join(',')||'學習中')+'\n最佳品種:'+(brain.bestSymbols.join(',')||'學習中')+'\n調參次數:'+brain.adjustHistory.length+'\n累計:'+all.total+'次 PnL:'+(all.pnl>=0?'+':'')+all.pnl.toFixed(2)+'U');
-    setInterval(function(){
-      var d2=getDayStat(),all2=stats.allTime;
-      tg('[Bybit 海馬] 每日報告\n今日:'+d2.total+'次 WR:'+(d2.total>0?(d2.wins/d2.total*100).toFixed(1):0)+'% PnL:'+(d2.pnl>=0?'+':'')+d2.pnl.toFixed(2)+'U\n最佳時段:'+(brain.bestHours.join(',')||'學習中')+'\n最佳品種:'+(brain.bestSymbols.join(',')||'學習中')+'\n累計:'+all2.total+'次 PnL:'+(all2.pnl>=0?'+':'')+all2.pnl.toFixed(2)+'U');
-    },24*60*60*1000);
-  },ms);
+    tg('[Bybit 海馬] 每日報告\n今日:'+d.total+'次 WR:'+(d.total>0?(d.wins/d.total*100).toFixed(1):0)+'% PnL:'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'U\n最佳時段:'+(brain.bestHours.join(',')||'學習中')+'\n最佳品種:'+(brain.bestSymbols.join(',')||'學習中')+'\n累計:'+all.total+'次 PnL:'+(all.pnl>=0?'+':'')+all.pnl.toFixed(2)+'U');
+    setInterval(function(){var d2=getDayStat(),all2=stats.allTime;tg('[Bybit 海馬] 每日報告\n今日:'+d2.total+'次 WR:'+(d2.total>0?(d2.wins/d2.total*100).toFixed(1):0)+'% PnL:'+(d2.pnl>=0?'+':'')+d2.pnl.toFixed(2)+'U\n累計:'+all2.total+'次 PnL:'+(all2.pnl>=0?'+':'')+all2.pnl.toFixed(2)+'U');},24*60*60*1000);
+  },ms10());
 }
 
 async function main(){
   console.log('\nBybit 海馬策略 AutoTrader v1.0\n');
-  log('INFO','Starting Bybit Seahorse...');
+  log('INFO','Starting...');
   startServer();
   try{
     var bal=await getBalance();
     log('OK','Bybit API OK! Available:'+bal.available.toFixed(2)+'U');
-    tg('[Bybit 海馬] Online!\nBalance:'+bal.available.toFixed(2)+'U\nSelf-Learning: ON\n指令前綴: /by\n輸入 /byhelp 查看指令');
-  }catch(e){log('ERROR','Bybit API fail: '+e.message);tg('[Bybit] Warning: '+e.message);}
+    tg('[Bybit 海馬] Online!\nBalance:'+bal.available.toFixed(2)+'U\nSelf-Learning: ON\n輸入 /help 查看指令');
+  }catch(e){log('ERROR','API fail: '+e.message);tg('[Bybit] Warning: '+e.message);}
   log('INFO','Starting Telegram polling...');
   tgPoll();
   scheduleReport();
-  log('OK','Bybit Ready. Use /byhelp');
+  log('OK','Bybit Ready. Use /help');
 }
 process.on('uncaughtException',function(e){log('ERROR','Uncaught: '+e.message);});
 process.on('unhandledRejection',function(e){log('ERROR','Unhandled: '+e);});
