@@ -89,7 +89,6 @@ function learnFromTrade(t){
 }
 
 function autoAdjustParams(){
-  // ✅ 只需 3 筆就開始學習（原本 5 筆）
   var recent=stats.trades.slice(-15);if(recent.length<3)return;
   var wins=recent.filter(function(t){return t.pnl>0;});
   var losses=recent.filter(function(t){return t.pnl<0;});
@@ -97,43 +96,49 @@ function autoAdjustParams(){
   var avgWin=wins.length?wins.reduce(function(s,t){return s+t.pnl;},0)/wins.length:0;
   var avgLoss=losses.length?Math.abs(losses.reduce(function(s,t){return s+t.pnl;},0)/losses.length):0;
   var rr=avgLoss>0?avgWin/avgLoss:1;
+  var avgHold=recent.reduce(function(s,t){return s+(t.holdMin||0);},0)/recent.length;
   var changes=[];
 
-  // 止損動態調整
-  if(wr<0.4&&cfg.stopLossPercent>1.0){
-    var o=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.max(1.0,o-0.3)).toFixed(1);
-    changes.push('SL 收緊 '+o+'->'+cfg.stopLossPercent+'%');
-  }
-  if(wr>0.65&&cfg.stopLossPercent<3.5){
-    var o2=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.min(3.5,o2+0.2)).toFixed(1);
-    changes.push('SL 放寬 '+o2+'->'+cfg.stopLossPercent+'%');
-  }
-  // 止盈動態調整
-  if(rr<1.5&&cfg.takeProfitPercent<12){
-    var o3=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.min(12,o3+0.5)).toFixed(1);
-    changes.push('TP 提高 '+o3+'->'+cfg.takeProfitPercent+'%');
-  }
-  if(rr>3.0&&cfg.takeProfitPercent>3.0){
-    var o4=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.max(3.0,o4-0.3)).toFixed(1);
-    changes.push('TP 降低 '+o4+'->'+cfg.takeProfitPercent+'%');
-  }
-  // ✅ 門檻動態調整（核心學習）
-  if(wr<0.35&&cfg.entryThreshold<5){
-    cfg.entryThreshold++;
-    changes.push('門檻提高 ->'+cfg.entryThreshold);
-    brain.entryThresholdHistory.push({date:todayKey(),val:cfg.entryThreshold,wr:(wr*100).toFixed(1)});
-  }
-  if(wr>0.65&&cfg.entryThreshold>1){
-    cfg.entryThreshold--;
-    changes.push('門檻降低 ->'+cfg.entryThreshold);
-    brain.entryThresholdHistory.push({date:todayKey(),val:cfg.entryThreshold,wr:(wr*100).toFixed(1)});
-  }
+  // ── 止損止盈 ──
+  if(wr<0.4&&cfg.stopLossPercent>1.0){var o=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.max(1.0,o-0.3)).toFixed(1);changes.push('SL 收緊 '+o+'->'+cfg.stopLossPercent+'%');}
+  if(wr>0.65&&cfg.stopLossPercent<3.5){var o2=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.min(3.5,o2+0.2)).toFixed(1);changes.push('SL 放寬 '+o2+'->'+cfg.stopLossPercent+'%');}
+  if(rr<1.5&&cfg.takeProfitPercent<12){var o3=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.min(12,o3+0.5)).toFixed(1);changes.push('TP 提高 '+o3+'->'+cfg.takeProfitPercent+'%');}
+  if(rr>3.0&&cfg.takeProfitPercent>3.0){var o4=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.max(3.0,o4-0.3)).toFixed(1);changes.push('TP 降低 '+o4+'->'+cfg.takeProfitPercent+'%');}
+
+  // ── 開單門檻 ──
+  if(wr<0.35&&cfg.entryThreshold<5){cfg.entryThreshold++;changes.push('門檻提高 ->'+cfg.entryThreshold);brain.entryThresholdHistory.push({date:todayKey(),val:cfg.entryThreshold,wr:(wr*100).toFixed(1)});}
+  if(wr>0.65&&cfg.entryThreshold>1){cfg.entryThreshold--;changes.push('門檻降低 ->'+cfg.entryThreshold);brain.entryThresholdHistory.push({date:todayKey(),val:cfg.entryThreshold,wr:(wr*100).toFixed(1)});}
+
+  // ── RSI 自動調整 ──
+  if(wr<0.38&&cfg.params.oversold>25){var rv=cfg.params.oversold;cfg.params.oversold=Math.max(25,rv-3);changes.push('RSI超賣 收緊 '+rv+'->'+cfg.params.oversold);}
+  if(wr<0.38&&cfg.params.overbought<75){var rv2=cfg.params.overbought;cfg.params.overbought=Math.min(75,rv2+3);changes.push('RSI超買 收緊 '+rv2+'->'+cfg.params.overbought);}
+  if(wr>0.62&&cfg.params.oversold<48){var rv3=cfg.params.oversold;cfg.params.oversold=Math.min(48,rv3+2);changes.push('RSI超賣 放寬 '+rv3+'->'+cfg.params.oversold);}
+  if(wr>0.62&&cfg.params.overbought>52){var rv4=cfg.params.overbought;cfg.params.overbought=Math.max(52,rv4-2);changes.push('RSI超買 放寬 '+rv4+'->'+cfg.params.overbought);}
+  if(wr<0.4&&avgHold<10&&cfg.params.rsiPeriod>7){var rp=cfg.params.rsiPeriod;cfg.params.rsiPeriod=Math.max(7,rp-1);changes.push('RSI週期 縮短 '+rp+'->'+cfg.params.rsiPeriod);}
+  if(wr<0.4&&avgHold>30&&cfg.params.rsiPeriod<21){var rp2=cfg.params.rsiPeriod;cfg.params.rsiPeriod=Math.min(21,rp2+1);changes.push('RSI週期 延長 '+rp2+'->'+cfg.params.rsiPeriod);}
+
+  // ── 布林帶自動調整 ──
+  if(wr<0.38&&cfg.params.bbStdDev<2.8){var bv=cfg.params.bbStdDev;cfg.params.bbStdDev=+(Math.min(2.8,bv+0.1)).toFixed(1);changes.push('BB寬度 加寬 '+bv+'->'+cfg.params.bbStdDev);}
+  if(wr>0.62&&cfg.params.bbStdDev>1.5){var bv2=cfg.params.bbStdDev;cfg.params.bbStdDev=+(Math.max(1.5,bv2-0.1)).toFixed(1);changes.push('BB寬度 收窄 '+bv2+'->'+cfg.params.bbStdDev);}
+  if(wr<0.4&&avgHold<15&&cfg.params.bbPeriod>12){var bp=cfg.params.bbPeriod;cfg.params.bbPeriod=Math.max(12,bp-1);changes.push('BB週期 縮短 '+bp+'->'+cfg.params.bbPeriod);}
+  if(wr>0.6&&cfg.params.bbPeriod<25){var bp2=cfg.params.bbPeriod;cfg.params.bbPeriod=Math.min(25,bp2+1);changes.push('BB週期 延長 '+bp2+'->'+cfg.params.bbPeriod);}
+
+  // ── MA 週期自動調整 ──
+  if(wr<0.4&&avgHold<15&&cfg.params.fastPeriod>5){var fp=cfg.params.fastPeriod;cfg.params.fastPeriod=Math.max(5,fp-1);changes.push('MA快線 縮短 '+fp+'->'+cfg.params.fastPeriod);}
+  if(wr>0.6&&cfg.params.fastPeriod<12){var fp2=cfg.params.fastPeriod;cfg.params.fastPeriod=Math.min(12,fp2+1);changes.push('MA快線 延長 '+fp2+'->'+cfg.params.fastPeriod);}
+  if(wr<0.4&&cfg.params.slowPeriod>15){var sp=cfg.params.slowPeriod;cfg.params.slowPeriod=Math.max(15,sp-2);changes.push('MA慢線 縮短 '+sp+'->'+cfg.params.slowPeriod);}
+  if(wr>0.6&&cfg.params.slowPeriod<30){var sp2=cfg.params.slowPeriod;cfg.params.slowPeriod=Math.min(30,sp2+1);changes.push('MA慢線 延長 '+sp2+'->'+cfg.params.slowPeriod);}
+
+  // ── 成交量門檻 ──
+  if(wr<0.38&&cfg.params.volMultiple<1.8){var vv=cfg.params.volMultiple;cfg.params.volMultiple=+(Math.min(1.8,vv+0.1)).toFixed(1);changes.push('量能門檻 提高 '+vv+'->'+cfg.params.volMultiple);}
+  if(wr>0.62&&cfg.params.volMultiple>1.0){var vv2=cfg.params.volMultiple;cfg.params.volMultiple=+(Math.max(1.0,vv2-0.1)).toFixed(1);changes.push('量能門檻 降低 '+vv2+'->'+cfg.params.volMultiple);}
 
   if(changes.length){
-    brain.adjustHistory.push({date:todayKey(),changes:changes,wr:(wr*100).toFixed(1),rr:rr.toFixed(2)});
+    brain.adjustHistory.push({date:todayKey(),changes:changes,wr:(wr*100).toFixed(1),rr:rr.toFixed(2),avgHold:avgHold.toFixed(0),
+      params:{rsi:cfg.params.oversold+'/'+cfg.params.overbought,rsiP:cfg.params.rsiPeriod,bb:cfg.params.bbPeriod+'/'+cfg.params.bbStdDev,ma:cfg.params.fastPeriod+'/'+cfg.params.slowPeriod,vol:cfg.params.volMultiple,thr:cfg.entryThreshold}});
     if(brain.adjustHistory.length>100)brain.adjustHistory=brain.adjustHistory.slice(-100);
     log('AI','自動調整: '+changes.join(' | '));
-    tg('🧠 AI 自動調整\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'% RR:'+rr.toFixed(2));
+    tg('🧠 AI 自動調整\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'% RR:'+rr.toFixed(2)+'\n持倉均時:'+avgHold.toFixed(0)+'min');
   }
 }
 
@@ -468,7 +473,7 @@ function handleUpdate(update){
   log('INFO','CMD: '+cmd+' from '+chatId);
 
   if(cmd==='/start'||cmd==='/help'){
-    tg('🤖 BingX AutoTrader v5.1\nSelf-Learning ON\n\n▶ 基本\n/go - 啟動\n/stop - 停止\n/status - 狀態\n/positions - 持倉\n/close SYMBOL - 手動平倉\n/log - 最近日誌\n\n⚙ 設定\n/set strategy AUTO\n/set tf 15m\n/set amount 50\n/set leverage 3\n/set sl 2\n/set tp 5\n/set threshold 1\n\n🧠 學習\n/brain - 學習狀態\n/weights - 策略權重\n/errors - 錯誤模式\n/adjustments - 調參記錄\n\n📊 績效\n/stats - 績效\n/history - 近10筆\n/report - AI 分析報告\n\n📌 幣種\n/addsym SYMBOL\n/delsym SYMBOL',chatId);return;
+    tg('🤖 BingX AutoTrader v5.2\nSelf-Learning ON\n\n▶ 基本\n/go - 啟動\n/stop - 停止\n/status - 狀態\n/positions - 持倉\n/close SYMBOL - 手動平倉\n/log - 最近日誌\n/params - 指標參數\n\n⚙ 設定\n/set strategy AUTO\n/set tf 15m\n/set amount 50\n/set leverage 3\n/set sl 2\n/set tp 5\n/set threshold 1\n\n🧠 學習\n/brain - 學習狀態\n/weights - 策略權重\n/errors - 錯誤模式\n/adjustments - 調參記錄\n\n📊 績效\n/stats - 績效\n/history - 近10筆\n/report - AI 分析報告\n\n📌 幣種\n/addsym SYMBOL\n/delsym SYMBOL',chatId);return;
   }
 
   if(cmd==='/go'){
@@ -518,6 +523,24 @@ function handleUpdate(update){
   if(cmd==='/log'){
     var recent=memLog.slice(-15);
     tg('[BingX] 最近日誌\n'+recent.map(function(l){return '['+l.lv+'] '+l.msg;}).join('\n'),chatId);return;
+  }
+
+  if(cmd==='/params'){
+    var p=cfg.params;
+    var lastAdj2=brain.adjustHistory.length?brain.adjustHistory[brain.adjustHistory.length-1]:null;
+    var pmsg='[BingX] 📐 當前指標參數\n\n';
+    pmsg+='RSI 週期: '+p.rsiPeriod+'\n';
+    pmsg+='RSI 超賣線: '+p.oversold+' (越高越容易買)\n';
+    pmsg+='RSI 超買線: '+p.overbought+' (越低越容易賣)\n\n';
+    pmsg+='BB 週期: '+p.bbPeriod+'\n';
+    pmsg+='BB 標準差: '+p.bbStdDev+' (越小越容易觸發)\n\n';
+    pmsg+='MA 快線: '+p.fastPeriod+' / 慢線: '+p.slowPeriod+'\n';
+    pmsg+='量能倍數: '+p.volMultiple+'x\n';
+    pmsg+='開單門檻: '+cfg.entryThreshold+'分\n';
+    pmsg+='止損: '+cfg.stopLossPercent+'%  止盈: '+cfg.takeProfitPercent+'%\n\n';
+    if(lastAdj2)pmsg+='📅 上次調整: '+lastAdj2.date+'\nWR:'+lastAdj2.wr+'% RR:'+lastAdj2.rr+'\n持倉均時:'+lastAdj2.avgHold+'min\n'+lastAdj2.changes.join('\n');
+    else pmsg+='⏳ 尚未自動調整（需累積交易記錄）';
+    tg(pmsg,chatId);return;
   }
 
   if(cmd==='/positions'){
