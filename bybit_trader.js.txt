@@ -282,6 +282,9 @@ function handleUpdate(update){
     else if(sk==='sl'&&nv>0){cfg.stopLossPercent=nv;tg('SL -> '+nv+'%',chatId);}
     else if(sk==='tp'&&nv>0){cfg.takeProfitPercent=nv;tg('TP -> '+nv+'%',chatId);}
     else if(sk==='tf'){if(['1m','3m','5m'].includes(sv)){cfg.timeframe=sv;tg('TF -> '+sv,chatId);}else tg('1m 3m 5m only',chatId);}
+    else if(sk==='oversold'&&nv>0&&nv<50){cfg.params.oversold=nv;tg('Oversold -> '+nv,chatId);}
+    else if(sk==='overbought'&&nv>50&&nv<100){cfg.params.overbought=nv;tg('Overbought -> '+nv,chatId);}
+    else if(sk==='volmul'&&nv>0){cfg.params.volMultiple=nv;tg('VolMultiple -> '+nv,chatId);}
     else tg('Unknown: '+sk,chatId);
     return;
   }
