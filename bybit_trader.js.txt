@@ -1,4 +1,3 @@
-
 'use strict';
 const crypto=require('crypto'),https=require('https'),http=require('http'),fs=require('fs');
 const ENV={
@@ -54,48 +53,57 @@ function learnFromTrade(t){
 }
 
 function autoAdjust(){
-  var recent=stats.trades.slice(-20);if(recent.length<5)return; // ✅ 只需 5 筆就開始學習（原本 10 筆）
+  var recent=stats.trades.slice(-20);if(recent.length<5)return;
   var wins=recent.filter(function(t){return t.pnl>0;});
   var losses=recent.filter(function(t){return t.pnl<0;});
   var wr=wins.length/recent.length;
   var avgWin=wins.length?wins.reduce(function(s,t){return s+t.pnl;},0)/wins.length:0;
   var avgLoss=losses.length?Math.abs(losses.reduce(function(s,t){return s+t.pnl;},0)/losses.length):0;
   var rr=avgLoss>0?avgWin/avgLoss:1;
+  var avgHold=recent.reduce(function(s,t){return s+(t.holdMin||0);},0)/recent.length;
   var changes=[];
 
-  // ✅ 根據勝率動態調整止損止盈
-  if(wr<0.4&&cfg.stopLossPercent>0.3){
-    var o=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.max(0.3,o-0.1)).toFixed(1);
-    changes.push('SL 收緊 '+o+'->'+cfg.stopLossPercent+'%');
-  }
-  if(wr>0.6&&cfg.stopLossPercent<1.2){
-    var o2=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.min(1.2,o2+0.1)).toFixed(1);
-    changes.push('SL 放寬 '+o2+'->'+cfg.stopLossPercent+'%');
-  }
-  if(rr<1.5&&cfg.takeProfitPercent<2.5){
-    var o3=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.min(2.5,o3+0.1)).toFixed(1);
-    changes.push('TP 提高 '+o3+'->'+cfg.takeProfitPercent+'%');
-  }
-  if(rr>2.5&&cfg.takeProfitPercent>0.8){
-    var o4=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.max(0.8,o4-0.1)).toFixed(1);
-    changes.push('TP 降低 '+o4+'->'+cfg.takeProfitPercent+'%');
-  }
+  // ── 止損止盈 ──
+  if(wr<0.4&&cfg.stopLossPercent>0.3){var o=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.max(0.3,o-0.1)).toFixed(1);changes.push('SL 收緊 '+o+'->'+cfg.stopLossPercent+'%');}
+  if(wr>0.6&&cfg.stopLossPercent<1.2){var o2=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.min(1.2,o2+0.1)).toFixed(1);changes.push('SL 放寬 '+o2+'->'+cfg.stopLossPercent+'%');}
+  if(rr<1.5&&cfg.takeProfitPercent<2.5){var o3=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.min(2.5,o3+0.1)).toFixed(1);changes.push('TP 提高 '+o3+'->'+cfg.takeProfitPercent+'%');}
+  if(rr>2.5&&cfg.takeProfitPercent>0.8){var o4=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.max(0.8,o4-0.1)).toFixed(1);changes.push('TP 降低 '+o4+'->'+cfg.takeProfitPercent+'%');}
 
-  // ✅ 根據勝率動態調整開單門檻
-  if(wr<0.35&&cfg.entryThreshold<4){
-    cfg.entryThreshold++;
-    changes.push('門檻提高 ->'+cfg.entryThreshold);
-  }
-  if(wr>0.65&&cfg.entryThreshold>1){
-    cfg.entryThreshold--;
-    changes.push('門檻降低 ->'+cfg.entryThreshold);
-  }
+  // ── 開單門檻 ──
+  if(wr<0.35&&cfg.entryThreshold<4){cfg.entryThreshold++;changes.push('門檻提高 ->'+cfg.entryThreshold);}
+  if(wr>0.65&&cfg.entryThreshold>1){cfg.entryThreshold--;changes.push('門檻降低 ->'+cfg.entryThreshold);}
+
+  // ── RSI 自動調整 ──
+  // 勝率低：收緊 RSI（更嚴格的超買超賣）
+  if(wr<0.38&&cfg.params.oversold>20){var rv=cfg.params.oversold;cfg.params.oversold=Math.max(20,rv-2);changes.push('RSI超賣 收緊 '+rv+'->'+cfg.params.oversold);}
+  if(wr<0.38&&cfg.params.overbought<80){var rv2=cfg.params.overbought;cfg.params.overbought=Math.min(80,rv2+2);changes.push('RSI超買 收緊 '+rv2+'->'+cfg.params.overbought);}
+  // 勝率高：放寬 RSI（更多進場機會）
+  if(wr>0.62&&cfg.params.oversold<45){var rv3=cfg.params.oversold;cfg.params.oversold=Math.min(45,rv3+2);changes.push('RSI超賣 放寬 '+rv3+'->'+cfg.params.oversold);}
+  if(wr>0.62&&cfg.params.overbought>55){var rv4=cfg.params.overbought;cfg.params.overbought=Math.max(55,rv4-2);changes.push('RSI超買 放寬 '+rv4+'->'+cfg.params.overbought);}
+  // RSI 週期：持倉時間短且虧損，縮短週期（更靈敏）
+  if(wr<0.4&&avgHold<5&&cfg.params.rsiPeriod>5){var rp=cfg.params.rsiPeriod;cfg.params.rsiPeriod=Math.max(5,rp-1);changes.push('RSI週期 縮短 '+rp+'->'+cfg.params.rsiPeriod);}
+  // 持倉時間長且虧損，延長週期（更穩定）
+  if(wr<0.4&&avgHold>15&&cfg.params.rsiPeriod<14){var rp2=cfg.params.rsiPeriod;cfg.params.rsiPeriod=Math.min(14,rp2+1);changes.push('RSI週期 延長 '+rp2+'->'+cfg.params.rsiPeriod);}
+
+  // ── 布林帶自動調整 ──
+  // 勝率低：加寬布林帶（減少假突破）
+  if(wr<0.38&&cfg.params.bbStdDev<2.5){var bv=cfg.params.bbStdDev;cfg.params.bbStdDev=+(Math.min(2.5,bv+0.1)).toFixed(1);changes.push('BB寬度 加寬 '+bv+'->'+cfg.params.bbStdDev);}
+  // 勝率高：收窄布林帶（更多進場機會）
+  if(wr>0.62&&cfg.params.bbStdDev>1.5){var bv2=cfg.params.bbStdDev;cfg.params.bbStdDev=+(Math.max(1.5,bv2-0.1)).toFixed(1);changes.push('BB寬度 收窄 '+bv2+'->'+cfg.params.bbStdDev);}
+  // 布林帶週期：市場變化快時縮短
+  if(wr<0.4&&avgHold<8&&cfg.params.bbPeriod>10){var bp=cfg.params.bbPeriod;cfg.params.bbPeriod=Math.max(10,bp-1);changes.push('BB週期 縮短 '+bp+'->'+cfg.params.bbPeriod);}
+  if(wr>0.6&&cfg.params.bbPeriod<20){var bp2=cfg.params.bbPeriod;cfg.params.bbPeriod=Math.min(20,bp2+1);changes.push('BB週期 延長 '+bp2+'->'+cfg.params.bbPeriod);}
+
+  // ── 成交量門檻自動調整 ──
+  if(wr<0.38&&cfg.params.volMultiple<2.0){var vv=cfg.params.volMultiple;cfg.params.volMultiple=+(Math.min(2.0,vv+0.1)).toFixed(1);changes.push('量能門檻 提高 '+vv+'->'+cfg.params.volMultiple);}
+  if(wr>0.62&&cfg.params.volMultiple>1.0){var vv2=cfg.params.volMultiple;cfg.params.volMultiple=+(Math.max(1.0,vv2-0.1)).toFixed(1);changes.push('量能門檻 降低 '+vv2+'->'+cfg.params.volMultiple);}
 
   if(changes.length){
-    brain.adjustHistory.push({date:todayKey(),changes:changes,wr:(wr*100).toFixed(1),rr:rr.toFixed(2)});
+    brain.adjustHistory.push({date:todayKey(),changes:changes,wr:(wr*100).toFixed(1),rr:rr.toFixed(2),
+      params:{rsi:cfg.params.oversold+'/'+cfg.params.overbought,rsiP:cfg.params.rsiPeriod,bb:cfg.params.bbPeriod+'/'+cfg.params.bbStdDev,vol:cfg.params.volMultiple,thr:cfg.entryThreshold}});
     if(brain.adjustHistory.length>100)brain.adjustHistory=brain.adjustHistory.slice(-100);
     log('AI','自動調整: '+changes.join(' | '));
-    tg('[Bybit AI 學習]\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'% RR:'+rr.toFixed(2));
+    tg('[Bybit 🧠 自動調整]\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'% RR:'+rr.toFixed(2)+'\n持倉均時:'+avgHold.toFixed(0)+'min');
   }
 }
 
@@ -366,7 +374,7 @@ function handleUpdate(update){
   log('INFO','CMD: '+cmd+' from '+chatId);
 
   if(cmd==='/start'||cmd==='/help'){
-    tg('🐴 Bybit 海馬策略 v2.0\nSelf-Learning ON\n\n▶ 基本指令\n/go - 啟動\n/stop - 停止\n/status - 狀態\n/positions - 持倉\n/brain - 學習狀態\n/stats - 績效\n/history - 近10筆\n/log - 最近日誌\n\n⚙ 設定\n/set amount 5\n/set leverage 5\n/set sl 0.5\n/set tp 1.0\n/set tf 3m\n/set threshold 2\n\n📊 幣種\n/addsym SOLUSDT\n/delsym SOLUSDT',chatId);
+    tg('🐴 Bybit 海馬策略 v2.1\nSelf-Learning ON\n\n▶ 基本指令\n/go - 啟動\n/stop - 停止\n/status - 狀態\n/positions - 持倉\n/brain - 學習狀態\n/stats - 績效\n/history - 近10筆\n/log - 最近日誌\n/params - 指標參數\n\n⚙ 設定\n/set amount 5\n/set leverage 5\n/set sl 0.5\n/set tp 1.0\n/set tf 3m\n/set threshold 2\n\n📊 幣種\n/addsym SOLUSDT\n/delsym SOLUSDT',chatId);
     return;
   }
 
@@ -407,6 +415,23 @@ function handleUpdate(update){
     var recent=memLog.slice(-15);
     tg('[Bybit] 最近日誌\n'+recent.map(function(l){return '['+l.lv+'] '+l.msg;}).join('\n'),chatId);
     return;
+  }
+
+  if(cmd==='/params'){
+    var p=cfg.params;
+    var lastAdj2=brain.adjustHistory.length?brain.adjustHistory[brain.adjustHistory.length-1]:null;
+    var pmsg='[Bybit] 📐 當前指標參數\n\n';
+    pmsg+='RSI 週期: '+p.rsiPeriod+'\n';
+    pmsg+='RSI 超賣線: '+p.oversold+' (越高越容易買)\n';
+    pmsg+='RSI 超買線: '+p.overbought+' (越低越容易賣)\n\n';
+    pmsg+='BB 週期: '+p.bbPeriod+'\n';
+    pmsg+='BB 標準差: '+p.bbStdDev+' (越小越容易觸發)\n\n';
+    pmsg+='量能倍數: '+p.volMultiple+'x\n';
+    pmsg+='開單門檻: '+cfg.entryThreshold+'分\n';
+    pmsg+='止損: '+cfg.stopLossPercent+'%  止盈: '+cfg.takeProfitPercent+'%\n\n';
+    if(lastAdj2)pmsg+='📅 上次調整: '+lastAdj2.date+'\nWR:'+lastAdj2.wr+'% RR:'+lastAdj2.rr+'\n'+lastAdj2.changes.join('\n');
+    else pmsg+='⏳ 尚未自動調整（需累積交易記錄）';
+    tg(pmsg,chatId);return;
   }
 
   if(cmd==='/positions'){
