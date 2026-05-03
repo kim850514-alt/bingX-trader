@@ -1,3 +1,4 @@
+
 'use strict';
 const crypto=require('crypto'),https=require('https'),http=require('http'),fs=require('fs');
 const ENV={
@@ -12,7 +13,9 @@ let cfg={
   tradeAmount:5,leverage:5,maxRiskPercent:10,
   stopLossPercent:0.5,takeProfitPercent:1.0,
   allowShort:true,botRunning:false,maxPositions:3,
-  params:{rsiPeriod:7,oversold:25,overbought:75,volMultiple:1.8,bbPeriod:15,bbStdDev:2}
+  // ✅ 開單門檻從 4 降到 2，更容易進場
+  entryThreshold:2,
+  params:{rsiPeriod:7,oversold:35,overbought:65,volMultiple:1.3,bbPeriod:15,bbStdDev:2}
 };
 let stats=loadStats();
 function loadStats(){if(fs.existsSync('./bybit_stats.json'))try{return JSON.parse(fs.readFileSync('./bybit_stats.json','utf8'));}catch(e){}return{allTime:{total:0,wins:0,losses:0,pnl:0},daily:{},trades:[]};}
@@ -29,23 +32,29 @@ function recordTrade(t){
   saveStats();learnFromTrade(t);
 }
 let brain=loadBrain();
-function loadBrain(){if(fs.existsSync('./bybit_brain.json'))try{return JSON.parse(fs.readFileSync('./bybit_brain.json','utf8'));}catch(e){}return{symbolPerf:{},hourPerf:{},errorPatterns:[],adjustHistory:[],learnCount:0,bestHours:[],worstHours:[],bestSymbols:[],worstSymbols:[]};}
+function loadBrain(){if(fs.existsSync('./bybit_brain.json'))try{return JSON.parse(fs.readFileSync('./bybit_brain.json','utf8'));}catch(e){}return{symbolPerf:{},hourPerf:{},errorPatterns:[],adjustHistory:[],learnCount:0,bestHours:[],worstHours:[],bestSymbols:[],worstSymbols:[],entryThresholdHistory:[]};}
 function saveBrain(){fs.writeFileSync('./bybit_brain.json',JSON.stringify(brain,null,2));}
+
 function learnFromTrade(t){
   brain.learnCount++;
   var symbol=t.symbol,pnl=t.pnl,holdMin=t.holdMin;
-  if(!brain.symbolPerf[symbol])brain.symbolPerf[symbol]={wins:0,losses:0,pnl:0};
-  var sp=brain.symbolPerf[symbol];if(pnl>0)sp.wins++;else sp.losses++;sp.pnl+=pnl;
+  if(!brain.symbolPerf[symbol])brain.symbolPerf[symbol]={wins:0,losses:0,pnl:0,avgHold:0,count:0};
+  var sp=brain.symbolPerf[symbol];
+  if(pnl>0)sp.wins++;else sp.losses++;
+  sp.pnl+=pnl;sp.count++;
+  sp.avgHold=((sp.avgHold*(sp.count-1))+holdMin)/sp.count;
   var hr=String(hourTW());
   if(!brain.hourPerf[hr])brain.hourPerf[hr]={wins:0,losses:0,pnl:0};
   var hp=brain.hourPerf[hr];if(pnl>0)hp.wins++;else hp.losses++;hp.pnl+=pnl;
   if(pnl<0){brain.errorPatterns.push({symbol:symbol,pnl:pnl,holdMin:holdMin,hour:hourTW(),date:todayKey()});if(brain.errorPatterns.length>100)brain.errorPatterns=brain.errorPatterns.slice(-100);}
-  if(brain.learnCount%10===0)autoAdjust();
+  // ✅ 每 5 筆就學習一次（原本 10 筆）
+  if(brain.learnCount%5===0)autoAdjust();
   updateBestWorst();saveBrain();
-  log('AI',pnl>0?symbol+' profit +'+pnl.toFixed(2)+'U':symbol+' loss '+pnl.toFixed(2)+'U');
+  log('AI',pnl>0?symbol+' 獲利 +'+pnl.toFixed(2)+'U (hold:'+holdMin+'min)':symbol+' 虧損 '+pnl.toFixed(2)+'U (hold:'+holdMin+'min)');
 }
+
 function autoAdjust(){
-  var recent=stats.trades.slice(-30);if(recent.length<10)return;
+  var recent=stats.trades.slice(-20);if(recent.length<5)return; // ✅ 只需 5 筆就開始學習（原本 10 筆）
   var wins=recent.filter(function(t){return t.pnl>0;});
   var losses=recent.filter(function(t){return t.pnl<0;});
   var wr=wins.length/recent.length;
@@ -53,24 +62,65 @@ function autoAdjust(){
   var avgLoss=losses.length?Math.abs(losses.reduce(function(s,t){return s+t.pnl;},0)/losses.length):0;
   var rr=avgLoss>0?avgWin/avgLoss:1;
   var changes=[];
-  if(wr<0.45&&cfg.stopLossPercent>0.3){var o=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.max(0.3,o-0.1)).toFixed(1);changes.push('SL '+o+'->'+cfg.stopLossPercent+'%');}
-  if(wr>0.6&&cfg.stopLossPercent<1.0){var o2=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.min(1.0,o2+0.1)).toFixed(1);changes.push('SL '+o2+'->'+cfg.stopLossPercent+'%');}
-  if(rr<1.8&&cfg.takeProfitPercent<2.0){var o3=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.min(2.0,o3+0.1)).toFixed(1);changes.push('TP '+o3+'->'+cfg.takeProfitPercent+'%');}
-  if(changes.length){brain.adjustHistory.push({date:todayKey(),changes:changes,wr:(wr*100).toFixed(1),rr:rr.toFixed(2)});if(brain.adjustHistory.length>50)brain.adjustHistory=brain.adjustHistory.slice(-50);log('AI','Auto adjust: '+changes.join(' | '));tg('[Bybit] Auto Adjust\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'% RR:'+rr.toFixed(2));}
+
+  // ✅ 根據勝率動態調整止損止盈
+  if(wr<0.4&&cfg.stopLossPercent>0.3){
+    var o=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.max(0.3,o-0.1)).toFixed(1);
+    changes.push('SL 收緊 '+o+'->'+cfg.stopLossPercent+'%');
+  }
+  if(wr>0.6&&cfg.stopLossPercent<1.2){
+    var o2=cfg.stopLossPercent;cfg.stopLossPercent=+(Math.min(1.2,o2+0.1)).toFixed(1);
+    changes.push('SL 放寬 '+o2+'->'+cfg.stopLossPercent+'%');
+  }
+  if(rr<1.5&&cfg.takeProfitPercent<2.5){
+    var o3=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.min(2.5,o3+0.1)).toFixed(1);
+    changes.push('TP 提高 '+o3+'->'+cfg.takeProfitPercent+'%');
+  }
+  if(rr>2.5&&cfg.takeProfitPercent>0.8){
+    var o4=cfg.takeProfitPercent;cfg.takeProfitPercent=+(Math.max(0.8,o4-0.1)).toFixed(1);
+    changes.push('TP 降低 '+o4+'->'+cfg.takeProfitPercent+'%');
+  }
+
+  // ✅ 根據勝率動態調整開單門檻
+  if(wr<0.35&&cfg.entryThreshold<4){
+    cfg.entryThreshold++;
+    changes.push('門檻提高 ->'+cfg.entryThreshold);
+  }
+  if(wr>0.65&&cfg.entryThreshold>1){
+    cfg.entryThreshold--;
+    changes.push('門檻降低 ->'+cfg.entryThreshold);
+  }
+
+  if(changes.length){
+    brain.adjustHistory.push({date:todayKey(),changes:changes,wr:(wr*100).toFixed(1),rr:rr.toFixed(2)});
+    if(brain.adjustHistory.length>100)brain.adjustHistory=brain.adjustHistory.slice(-100);
+    log('AI','自動調整: '+changes.join(' | '));
+    tg('[Bybit AI 學習]\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'% RR:'+rr.toFixed(2));
+  }
 }
+
 function updateBestWorst(){
-  brain.bestHours=Object.keys(brain.hourPerf).filter(function(h){var p=brain.hourPerf[h];var t=p.wins+p.losses;return t>=5&&p.wins/t>=0.6;});
-  brain.worstHours=Object.keys(brain.hourPerf).filter(function(h){var p=brain.hourPerf[h];var t=p.wins+p.losses;return t>=5&&p.wins/t<0.4;});
-  brain.bestSymbols=Object.keys(brain.symbolPerf).filter(function(s){var p=brain.symbolPerf[s];var t=p.wins+p.losses;return t>=5&&p.wins/t>=0.55;});
-  brain.worstSymbols=Object.keys(brain.symbolPerf).filter(function(s){var p=brain.symbolPerf[s];var t=p.wins+p.losses;return t>=5&&p.wins/t<0.35&&p.pnl<-10;});
+  // ✅ 降低最低樣本數從 5 到 3，更快學習
+  brain.bestHours=Object.keys(brain.hourPerf).filter(function(h){var p=brain.hourPerf[h];var t=p.wins+p.losses;return t>=3&&p.wins/t>=0.6;});
+  brain.worstHours=Object.keys(brain.hourPerf).filter(function(h){var p=brain.hourPerf[h];var t=p.wins+p.losses;return t>=3&&p.wins/t<0.35;});
+  brain.bestSymbols=Object.keys(brain.symbolPerf).filter(function(s){var p=brain.symbolPerf[s];var t=p.wins+p.losses;return t>=3&&p.wins/t>=0.55;});
+  brain.worstSymbols=Object.keys(brain.symbolPerf).filter(function(s){var p=brain.symbolPerf[s];var t=p.wins+p.losses;return t>=5&&p.wins/t<0.3&&p.pnl<-5;});
 }
-function isGoodHour(){var hr=String(hourTW());if(brain.worstHours.includes(hr)){log('AI','Bad hour skip');return false;}return true;}
+
+function isGoodHour(){
+  var hr=String(hourTW());
+  if(brain.worstHours.includes(hr)){log('AI','迴避時段 '+hr+'時，跳過');return false;}
+  return true;
+}
+
 var memLog=[];
 function log(lv,msg){console.log('['+nowTW()+'][BY]['+lv+'] '+msg);memLog.push({ts:nowTW(),lv:lv,msg:msg});if(memLog.length>300)memLog.shift();}
+
 function bybitSign(data,timestamp){
   var msg=timestamp+''+ENV.BYBIT_API_KEY+'5000'+data;
   return crypto.createHmac('sha256',ENV.BYBIT_SECRET).update(msg).digest('hex');
 }
+
 function bybitReq(method,path,params,tries){
   params=params||{};tries=tries||3;
   return new Promise(function(resolve,reject){
@@ -90,6 +140,7 @@ function bybitReq(method,path,params,tries){
     go(tries);
   });
 }
+
 async function getBalance(){
   try{
     var r=await bybitReq('GET','/v5/account/wallet-balance',{accountType:'UNIFIED'});
@@ -97,97 +148,193 @@ async function getBalance(){
   }catch(e){}
   throw new Error('Cannot get Bybit balance');
 }
+
 async function getPositions(symbol){try{var p={category:'linear',settleCoin:'USDT'};if(symbol)p.symbol=symbol;var r=await bybitReq('GET','/v5/position/list',p);if(r.retCode===0)return(r.result.list||[]).filter(function(p){return parseFloat(p.size||0)!==0;});}catch(e){}return[];}
 async function getKlines(symbol,interval,limit){limit=limit||100;try{var r=await bybitReq('GET','/v5/market/kline',{category:'linear',symbol:symbol,interval:interval,limit:limit});if(r.retCode===0)return r.result.list||[];}catch(e){}return[];}
 async function getTicker(symbol){try{var r=await bybitReq('GET','/v5/market/tickers',{category:'linear',symbol:symbol});if(r.retCode===0)return r.result.list[0];}catch(e){}return null;}
 async function setLeverage(symbol,leverage){try{await bybitReq('POST','/v5/position/set-leverage',{category:'linear',symbol:symbol,buyLeverage:String(leverage),sellLeverage:String(leverage)});}catch(e){}}
+
 async function placeOrder(o){
   await setLeverage(o.symbol,cfg.leverage);
   var p={category:'linear',symbol:o.symbol,side:o.side,orderType:'Market',qty:String(o.quantity),positionIdx:o.side==='Buy'?1:2};
   if(o.stopLoss)p.stopLoss=String(o.stopLoss);
   if(o.takeProfit)p.takeProfit=String(o.takeProfit);
-  log('INFO','Order '+o.side+' '+o.symbol+' x'+o.quantity);
+  log('INFO','下單 '+o.side+' '+o.symbol+' x'+o.quantity);
   var r=await bybitReq('POST','/v5/order/create',p);
-  if(r.retCode===0){log('OK','OK '+o.side+' '+o.symbol);tg('[Bybit] OK\n'+(o.side==='Buy'?'LONG':'SHORT')+' '+o.symbol+' x'+o.quantity);return r.result;}
-  else{log('ERROR','FAIL ['+r.retCode+'] '+r.retMsg);tg('[Bybit] FAIL '+o.symbol+' '+r.retMsg);return null;}
+  if(r.retCode===0){log('OK','成功 '+o.side+' '+o.symbol);tg('[Bybit] ✅ 開單成功\n'+(o.side==='Buy'?'🟢 多單':'🔴 空單')+' '+o.symbol+'\n數量:'+o.quantity+'\nSL:'+o.stopLoss+' TP:'+o.takeProfit);return r.result;}
+  else{log('ERROR','失敗 ['+r.retCode+'] '+r.retMsg);tg('[Bybit] ❌ 開單失敗\n'+o.symbol+'\n原因:'+r.retMsg);return null;}
 }
+
 async function closePos(sym,side,qty){return placeOrder({symbol:sym,side:side==='Buy'?'Sell':'Buy',quantity:qty,positionIdx:side==='Buy'?1:2});}
+
 var I={
   ma:function(a,n){if(a.length<n)return null;return a.slice(-n).reduce(function(s,v){return s+v;},0)/n;},
+  ema:function(a,n){
+    if(a.length<n)return null;
+    var k=2/(n+1),ema=a.slice(0,n).reduce(function(s,v){return s+v;},0)/n;
+    for(var i=n;i<a.length;i++)ema=a[i]*k+ema*(1-k);
+    return ema;
+  },
   rsi:function(a,n){n=n||14;if(a.length<n+1)return null;var g=0,l=0;for(var i=a.length-n;i<a.length;i++){var d=a[i]-a[i-1];if(d>0)g+=d;else l-=d;}return 100-100/(1+g/(l||0.0001));},
   boll:function(a,n,d){n=n||20;d=d||2;if(a.length<n)return null;var sl=a.slice(-n),m=sl.reduce(function(s,v){return s+v;},0)/n,std=Math.sqrt(sl.reduce(function(s,v){return s+Math.pow(v-m,2);},0)/n);return{upper:m+d*std,mid:m,lower:m-d*std};},
-  atr:function(h,l,c,n){n=n||14;if(c.length<n+1)return null;var tr=[];for(var i=1;i<c.length;i++)tr.push(Math.max(h[i]-l[i],Math.abs(h[i]-c[i-1]),Math.abs(l[i]-c[i-1])));return tr.slice(-n).reduce(function(s,v){return s+v;},0)/n;}
+  atr:function(h,l,c,n){n=n||14;if(c.length<n+1)return null;var tr=[];for(var i=1;i<c.length;i++)tr.push(Math.max(h[i]-l[i],Math.abs(h[i]-c[i-1]),Math.abs(l[i]-c[i-1])));return tr.slice(-n).reduce(function(s,v){return s+v;},0)/n;},
+  macd:function(a){
+    if(a.length<26)return null;
+    var fast=I.ema(a,12),slow=I.ema(a,26);
+    if(!fast||!slow)return null;
+    return{macd:fast-slow,signal:0,hist:fast-slow};
+  }
 };
+
 async function runSeahorse(sym){
-  if(!isGoodHour())return null;
-  if(brain.worstSymbols.includes(sym))return null;
-  var kl=await getKlines(sym,cfg.timeframe,100);if(kl.length<50)return null;
+  // ✅ 移除 isGoodHour 的硬性封鎖（改為扣分）
+  var hourPenalty=0;
+  var hr=String(hourTW());
+  if(brain.worstHours.includes(hr)){hourPenalty=1;log('AI','差時段 '+hr+'時，扣1分繼續');}
+
+  if(brain.worstSymbols.includes(sym)){log('AI',sym+' 迴避品種，跳過');return null;}
+
+  var kl=await getKlines(sym,cfg.timeframe,120);
+  if(kl.length<50)return null;
+
   var closes=kl.map(function(k){return parseFloat(k[4]);}).reverse();
   var highs=kl.map(function(k){return parseFloat(k[2]);}).reverse();
   var lows=kl.map(function(k){return parseFloat(k[3]);}).reverse();
   var vols=kl.map(function(k){return parseFloat(k[5]);}).reverse();
   var last=closes[closes.length-1],p=cfg.params;
   var bs=0,ss=0,rsn=[];
-  var rsi=I.rsi(closes,p.rsiPeriod||7),rsiPrev=I.rsi(closes.slice(0,-1),p.rsiPeriod||7);
-  if(rsi&&rsiPrev){if(rsiPrev<25&&rsi>25){bs+=3;rsn.push('RSI-OS('+rsi.toFixed(0)+')');}if(rsiPrev>75&&rsi<75){ss+=3;rsn.push('RSI-OB('+rsi.toFixed(0)+')');}if(rsi<35)bs++;if(rsi>65)ss++;}
+
+  // ✅ 信號1: RSI（放寬閾值 oversold:35, overbought:65）
+  var rsi=I.rsi(closes,p.rsiPeriod||7);
+  var rsiPrev=I.rsi(closes.slice(0,-1),p.rsiPeriod||7);
+  if(rsi&&rsiPrev){
+    // 突破回升（加重訊號）
+    if(rsiPrev<p.oversold&&rsi>p.oversold){bs+=3;rsn.push('RSI回升('+rsi.toFixed(0)+')');}
+    if(rsiPrev>p.overbought&&rsi<p.overbought){ss+=3;rsn.push('RSI回落('+rsi.toFixed(0)+')');}
+    // 接近超買超賣也給分
+    if(rsi<40){bs+=1;rsn.push('RSI低('+rsi.toFixed(0)+')');}
+    if(rsi>60){ss+=1;rsn.push('RSI高('+rsi.toFixed(0)+')');}
+  }
+
+  // ✅ 信號2: 成交量（放寬倍數 1.3）
   var avgVol=I.ma(vols.slice(0,-1),20),curVol=vols[vols.length-1];
-  if(avgVol&&curVol>avgVol*1.8){bs++;ss++;rsn.push('VOL+');}else{bs=Math.max(0,bs-1);ss=Math.max(0,ss-1);}
-  var bb=I.boll(closes,15,2);
-  if(bb){if(last<bb.lower){bs+=2;rsn.push('BB-L');}if(last>bb.upper){ss+=2;rsn.push('BB-U');}}
-  var signal='HOLD';if(bs>=4||ss>=4)signal=bs>=ss?'BUY':'SELL';
+  if(avgVol&&curVol>avgVol*p.volMultiple){
+    bs+=1;ss+=1;rsn.push('量增('+(curVol/avgVol).toFixed(1)+'x)');
+  }
+
+  // ✅ 信號3: 布林帶
+  var bb=I.boll(closes,p.bbPeriod||15,p.bbStdDev||2);
+  if(bb){
+    if(last<bb.lower){bs+=2;rsn.push('BB下軌');}
+    else if(last<bb.mid&&last>bb.lower){bs+=1;rsn.push('BB下半');}
+    if(last>bb.upper){ss+=2;rsn.push('BB上軌');}
+    else if(last>bb.mid&&last<bb.upper){ss+=1;rsn.push('BB上半');}
+  }
+
+  // ✅ 信號4: EMA 趨勢（新增）
+  var ema9=I.ema(closes,9),ema21=I.ema(closes,21);
+  if(ema9&&ema21){
+    if(ema9>ema21){bs+=1;rsn.push('EMA多');}
+    else{ss+=1;rsn.push('EMA空');}
+  }
+
+  // ✅ 信號5: MACD（新增）
+  var macdData=I.macd(closes);
+  if(macdData){
+    if(macdData.hist>0){bs+=1;rsn.push('MACD+');}
+    else{ss+=1;rsn.push('MACD-');}
+  }
+
+  // 時段懲罰
+  bs=Math.max(0,bs-hourPenalty);
+  ss=Math.max(0,ss-hourPenalty);
+
+  // ✅ 使用動態門檻（可被 AI 自動調整）
+  var threshold=cfg.entryThreshold||2;
+  var signal='HOLD';
+  if(bs>=threshold||ss>=threshold){
+    signal=bs>=ss?'BUY':'SELL';
+  }
+
   var atrV=I.atr(highs,lows,closes)||last*0.005;
-  return{signal:signal,reasons:rsn.join('+'),price:last,atrV:atrV};
+  log('INFO',sym+' BS:'+bs+' SS:'+ss+' 門檻:'+threshold+' -> '+signal+(rsn.length?' ['+rsn.join('+')+']':''));
+  return{signal:signal,reasons:rsn.join('+'),price:last,atrV:atrV,bs:bs,ss:ss};
 }
+
 var openTrades={},botTimer=null,startTime=Date.now();
+
 async function tradingLoop(){
   if(!cfg.botRunning)return;
-  log('INFO','--- Loop '+nowTW()+' ---');
-  if(Object.keys(openTrades).length>=cfg.maxPositions){await checkPositions();return;}
-  for(var i=0;i<cfg.symbols.length;i++){
-    var sym=cfg.symbols[i];
-    try{
-      var res=await runSeahorse(sym);if(!res)continue;
-      var signal=res.signal,reasons=res.reasons,atrV=res.atrV;
-      var tk=await getTicker(sym);var cur=tk?parseFloat(tk.lastPrice):res.price;
-      log('INFO',sym+' '+cur.toFixed(4)+' '+signal+(reasons?' '+reasons:''));
-      if(signal==='HOLD')continue;
-      var bal=await getBalance();var amt=Math.min(cfg.tradeAmount,bal.available*(cfg.maxRiskPercent/100));
-      if(amt<1){log('WARN',sym+' low balance');continue;}
-      var qty=parseFloat((amt*cfg.leverage/cur).toFixed(4));if(qty<=0)continue;
-      var slD=Math.max(atrV*1.2,cur*cfg.stopLossPercent/100);
-      var tpD=Math.max(atrV*2.0,cur*cfg.takeProfitPercent/100);
-      var slP=signal==='BUY'?+(cur-slD).toFixed(4):+(cur+slD).toFixed(4);
-      var tpP=signal==='BUY'?+(cur+tpD).toFixed(4):+(cur-tpD).toFixed(4);
-      var pos=await getPositions(sym);
-      if(signal==='BUY'&&!pos.some(function(p){return p.side==='Buy';})&&!openTrades[sym+'_L']){
-        var o=await placeOrder({symbol:sym,side:'Buy',quantity:qty,stopLoss:slP,takeProfit:tpP});
-        if(o)openTrades[sym+'_L']={symbol:sym,side:'Buy',entry:cur,qty:qty,reason:reasons,openTime:Date.now()};
-      }
-      if(signal==='SELL'&&cfg.allowShort&&!pos.some(function(p){return p.side==='Sell';})&&!openTrades[sym+'_S']){
-        var o2=await placeOrder({symbol:sym,side:'Sell',quantity:qty,stopLoss:slP,takeProfit:tpP});
-        if(o2)openTrades[sym+'_S']={symbol:sym,side:'Sell',entry:cur,qty:qty,reason:reasons,openTime:Date.now()};
-      }
-    }catch(e){log('ERROR',sym+': '+e.message);}
-  }
-  await checkPositions();
+  log('INFO','=== Loop '+nowTW()+' ===');
+  try{
+    var posCount=Object.keys(openTrades).length;
+    if(posCount>=cfg.maxPositions){
+      log('INFO','已達最大持倉 '+posCount+'/'+cfg.maxPositions+'，只檢查平倉');
+      await checkPositions();
+      return;
+    }
+    for(var i=0;i<cfg.symbols.length;i++){
+      var sym=cfg.symbols[i];
+      try{
+        var res=await runSeahorse(sym);
+        if(!res||res.signal==='HOLD')continue;
+        var signal=res.signal,reasons=res.reasons,atrV=res.atrV;
+        var tk=await getTicker(sym);
+        var cur=tk?parseFloat(tk.lastPrice):res.price;
+        log('INFO',sym+' 當前價:'+cur.toFixed(4)+' 信號:'+signal+' 原因:'+reasons);
+        var bal=await getBalance();
+        var amt=Math.min(cfg.tradeAmount,bal.available*(cfg.maxRiskPercent/100));
+        if(amt<1){log('WARN',sym+' 餘額不足 '+bal.available.toFixed(2)+'U');continue;}
+        var qty=parseFloat((amt*cfg.leverage/cur).toFixed(4));
+        if(qty<=0)continue;
+        var slD=Math.max(atrV*1.2,cur*cfg.stopLossPercent/100);
+        var tpD=Math.max(atrV*2.0,cur*cfg.takeProfitPercent/100);
+        var slP=signal==='BUY'?+(cur-slD).toFixed(4):+(cur+slD).toFixed(4);
+        var tpP=signal==='BUY'?+(cur+tpD).toFixed(4):+(cur-tpD).toFixed(4);
+        var pos=await getPositions(sym);
+        if(signal==='BUY'&&!pos.some(function(p){return p.side==='Buy';})&&!openTrades[sym+'_L']){
+          var o=await placeOrder({symbol:sym,side:'Buy',quantity:qty,stopLoss:slP,takeProfit:tpP});
+          if(o)openTrades[sym+'_L']={symbol:sym,side:'Buy',entry:cur,qty:qty,reason:reasons,openTime:Date.now()};
+        }
+        if(signal==='SELL'&&cfg.allowShort&&!pos.some(function(p){return p.side==='Sell';})&&!openTrades[sym+'_S']){
+          var o2=await placeOrder({symbol:sym,side:'Sell',quantity:qty,stopLoss:slP,takeProfit:tpP});
+          if(o2)openTrades[sym+'_S']={symbol:sym,side:'Sell',entry:cur,qty:qty,reason:reasons,openTime:Date.now()};
+        }
+      }catch(e){log('ERROR',sym+' 錯誤: '+e.message);}
+    }
+    await checkPositions();
+  }catch(e){log('ERROR','Loop錯誤: '+e.message);}
 }
+
 async function checkPositions(){
   for(var key in openTrades){
-    var t=openTrades[key];var tk=await getTicker(t.symbol).catch(function(){return null;});if(!tk)continue;
-    var cur=parseFloat(tk.lastPrice);var holdMin=Math.round((Date.now()-t.openTime)/60000);
-    var pnl=t.side==='Buy'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;
-    if(holdMin>=30){
-      var o=await closePos(t.symbol,t.side,t.qty).catch(function(){return null;});
-      if(o){recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl,holdMin:holdMin,reason:'timeout'});delete openTrades[key];tg('[Bybit] 超時平倉 '+t.symbol+'\nPnL:'+(pnl>=0?'+':'')+pnl.toFixed(2)+'U Hold:'+holdMin+'min');}
-    }
+    try{
+      var t=openTrades[key];
+      var tk=await getTicker(t.symbol).catch(function(){return null;});
+      if(!tk)continue;
+      var cur=parseFloat(tk.lastPrice);
+      var holdMin=Math.round((Date.now()-t.openTime)/60000);
+      var pnl=t.side==='Buy'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;
+      log('INFO','持倉 '+t.symbol+' PnL:'+(pnl>=0?'+':'')+pnl.toFixed(2)+'U Hold:'+holdMin+'min');
+      if(holdMin>=30){
+        var o=await closePos(t.symbol,t.side,t.qty).catch(function(){return null;});
+        if(o){
+          recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl,holdMin:holdMin,reason:'超時平倉'});
+          delete openTrades[key];
+          tg('[Bybit] ⏰ 超時平倉\n'+t.symbol+'\nPnL:'+(pnl>=0?'✅ +':'❌ ')+pnl.toFixed(2)+'U\nHold:'+holdMin+'min');
+        }
+      }
+    }catch(e){log('ERROR','checkPositions '+e.message);}
   }
 }
+
 function tg(text,chatId){
   var id=chatId||ENV.TG_CHAT;if(!ENV.TG_TOKEN||!id)return;
   var body=JSON.stringify({chat_id:id,text:text,parse_mode:'HTML'});
   var req=https.request({hostname:'api.telegram.org',path:'/bot'+ENV.TG_TOKEN+'/sendMessage',method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}},function(r){var d='';r.on('data',function(c){d+=c;});});
   req.on('error',function(){});req.write(body);req.end();
 }
+
 var lastUpdateId=0;
 function tgPoll(){
   if(!ENV.TG_TOKEN)return;
@@ -210,44 +357,58 @@ function tgPoll(){
   req.setTimeout(35000,function(){req.destroy();setTimeout(tgPoll,1000);});
   req.end();
 }
+
 function handleUpdate(update){
   var msg=update.message||update.edited_message;if(!msg)return;
   var chatId=String(msg.chat.id),text=(msg.text||'').trim();
   if(ENV.TG_CHAT&&chatId!==ENV.TG_CHAT){tg('Unauthorized',chatId);return;}
   var parts=text.split(' '),cmd=parts[0].toLowerCase(),args=parts.slice(1);
   log('INFO','CMD: '+cmd+' from '+chatId);
+
   if(cmd==='/start'||cmd==='/help'){
-    tg('Bybit 海馬策略 v1.0\nSelf-Learning ON\n\n/go - 啟動\n/stop - 停止\n/status - 狀態\n/positions - 持倉\n/brain - 學習狀態\n/stats - 績效\n/history - 近10筆\n/set amount 5\n/set leverage 5\n/set sl 0.5\n/set tp 1.0\n/set tf 3m\n/addsym SOLUSDT\n/delsym SOLUSDT',chatId);
+    tg('🐴 Bybit 海馬策略 v2.0\nSelf-Learning ON\n\n▶ 基本指令\n/go - 啟動\n/stop - 停止\n/status - 狀態\n/positions - 持倉\n/brain - 學習狀態\n/stats - 績效\n/history - 近10筆\n/log - 最近日誌\n\n⚙ 設定\n/set amount 5\n/set leverage 5\n/set sl 0.5\n/set tp 1.0\n/set tf 3m\n/set threshold 2\n\n📊 幣種\n/addsym SOLUSDT\n/delsym SOLUSDT',chatId);
     return;
   }
+
   if(cmd==='/go'){
-    if(cfg.botRunning){tg('Already running',chatId);return;}
+    if(cfg.botRunning){tg('⚠️ 已在運行中',chatId);return;}
     cfg.botRunning=true;
     var ms={'1m':60000,'3m':180000,'5m':300000}[cfg.timeframe]||180000;
-    botTimer=setInterval(tradingLoop,ms);
-    tradingLoop();
-    tg('Bybit 海馬啟動!\nTF:'+cfg.timeframe+' Lev:'+cfg.leverage+'x\nAmt:'+cfg.tradeAmount+'U SL:'+cfg.stopLossPercent+'% TP:'+cfg.takeProfitPercent+'%\nSymbols:'+cfg.symbols.join(',')+'\nSelf-Learning: ON',chatId);
+    botTimer=setInterval(function(){tradingLoop().catch(function(e){log('ERROR','Timer: '+e.message);});},ms);
+    tradingLoop().catch(function(e){log('ERROR','Go: '+e.message);});
+    tg('🚀 Bybit 海馬啟動!\nTF:'+cfg.timeframe+' Lev:'+cfg.leverage+'x\nAmt:'+cfg.tradeAmount+'U SL:'+cfg.stopLossPercent+'% TP:'+cfg.takeProfitPercent+'%\n門檻:'+cfg.entryThreshold+'分\nSymbols:'+cfg.symbols.join(',')+'\nSelf-Learning: ON ✅',chatId);
     return;
   }
+
   if(cmd==='/stop'){
     cfg.botRunning=false;clearInterval(botTimer);botTimer=null;
-    tg('Stopped',chatId);return;
+    tg('⏹ 已停止',chatId);return;
   }
+
   if(cmd==='/status'){
     getBalance().then(function(bal){
       var d=getDayStat(),all=stats.allTime;
-      tg('[Bybit]\n'+(cfg.botRunning?'RUNNING':'STOPPED')+' Uptime:'+Math.round((Date.now()-startTime)/60000)+'min\nBalance:'+bal.available.toFixed(2)+'U Total:'+bal.total.toFixed(2)+'U\nToday:'+d.total+' WR:'+(d.total>0?(d.wins/d.total*100).toFixed(0):0)+'% PnL:'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'U\nAll:'+all.total+' WR:'+(all.total>0?(all.wins/all.total*100).toFixed(0):0)+'% PnL:'+(all.pnl>=0?'+':'')+all.pnl.toFixed(2)+'U\nLearned:'+brain.learnCount+'\nPositions:'+Object.keys(openTrades).length,chatId);
+      tg('[Bybit] 狀態\n'+(cfg.botRunning?'🟢 運行中':'🔴 已停止')+' Uptime:'+Math.round((Date.now()-startTime)/60000)+'min\n餘額:'+bal.available.toFixed(2)+'U / 總計:'+bal.total.toFixed(2)+'U\n今日:'+d.total+'筆 WR:'+(d.total>0?(d.wins/d.total*100).toFixed(0):0)+'% PnL:'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'U\n全部:'+all.total+'筆 WR:'+(all.total>0?(all.wins/all.total*100).toFixed(0):0)+'% PnL:'+(all.pnl>=0?'+':'')+all.pnl.toFixed(2)+'U\n已學習:'+brain.learnCount+'次\n持倉:'+Object.keys(openTrades).length+'/'+cfg.maxPositions+'\n開單門檻:'+cfg.entryThreshold+'分',chatId);
     }).catch(function(e){tg('Error: '+e.message,chatId);});
     return;
   }
+
   if(cmd==='/brain'){
     var bestH=brain.bestHours.length?brain.bestHours.join(',')+'時':'學習中';
     var worstH=brain.worstHours.length?brain.worstHours.join(',')+'時':'無';
     var bestS=brain.bestSymbols.length?brain.bestSymbols.join(','):'學習中';
     var worstS=brain.worstSymbols.length?brain.worstSymbols.join(','):'無';
-    tg('[Bybit] 學習狀態\nLearned:'+brain.learnCount+'\n最佳時段:'+bestH+'\n迴避時段:'+worstH+'\n最佳品種:'+bestS+'\n迴避品種:'+worstS+'\n調參:'+brain.adjustHistory.length+'次',chatId);
+    var lastAdj=brain.adjustHistory.length?brain.adjustHistory[brain.adjustHistory.length-1]:{changes:['尚未調整']};
+    tg('[Bybit] 🧠 學習狀態\n已學習:'+brain.learnCount+'次\n最佳時段:'+bestH+'\n迴避時段:'+worstH+'\n最佳品種:'+bestS+'\n迴避品種:'+worstS+'\n調參次數:'+brain.adjustHistory.length+'次\n最近調整:'+lastAdj.changes.join(', '),chatId);
     return;
   }
+
+  if(cmd==='/log'){
+    var recent=memLog.slice(-15);
+    tg('[Bybit] 最近日誌\n'+recent.map(function(l){return '['+l.lv+'] '+l.msg;}).join('\n'),chatId);
+    return;
+  }
+
   if(cmd==='/positions'){
     var keys=Object.keys(openTrades);
     if(!keys.length){tg('[Bybit] 無持倉',chatId);return;}
@@ -256,80 +417,102 @@ function handleUpdate(update){
       keys.forEach(function(k,i){
         var t=openTrades[k],cur=tks[i]?parseFloat(tks[i].lastPrice):t.entry;
         var pnl=t.side==='Buy'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;
-        m+=t.symbol+' '+(t.side==='Buy'?'多':'空')+'\nEntry:'+t.entry.toFixed(4)+' Now:'+cur.toFixed(4)+'\nPnL:'+(pnl>=0?'+':'')+pnl.toFixed(2)+'U Hold:'+Math.round((Date.now()-t.openTime)/60000)+'min\n\n';
+        m+=(t.side==='Buy'?'🟢':'🔴')+' '+t.symbol+'\nEntry:'+t.entry.toFixed(4)+' Now:'+cur.toFixed(4)+'\nPnL:'+(pnl>=0?'✅ +':'❌ ')+pnl.toFixed(2)+'U Hold:'+Math.round((Date.now()-t.openTime)/60000)+'min\n原因:'+t.reason+'\n\n';
       });
       tg(m,chatId);
     });
     return;
   }
+
   if(cmd==='/stats'){
-    var al=stats.allTime,dds=getDayStat();var w7='',p7=0;
-    for(var i=6;i>=0;i--){var dd=new Date();dd.setDate(dd.getDate()-i);var dk=dd.toLocaleDateString('zh-TW',{timeZone:'Asia/Taipei'});var ds=getDayStat(dk);p7+=ds.pnl;w7+=dk.slice(5)+':'+ds.total+'x '+(ds.pnl>=0?'+':'')+ds.pnl.toFixed(0)+'U\n';}
-    tg('[Bybit] Stats\nToday:'+dds.total+' WR:'+(dds.total>0?(dds.wins/dds.total*100).toFixed(0):0)+'% PnL:'+(dds.pnl>=0?'+':'')+dds.pnl.toFixed(2)+'U\n7days:\n'+w7+'All:'+al.total+' WR:'+(al.total>0?(al.wins/al.total*100).toFixed(1):0)+'% PnL:'+(al.pnl>=0?'+':'')+al.pnl.toFixed(2)+'U',chatId);
+    var al=stats.allTime,dds=getDayStat();
+    var w7='',p7=0;
+    // ✅ 修復原本 i-- 寫成 i– 的致命 bug
+    for(var i=6;i>=0;i--){
+      var dd=new Date();
+      dd.setDate(dd.getDate()-i);
+      var dk=dd.toLocaleDateString('zh-TW',{timeZone:'Asia/Taipei'});
+      var ds=getDayStat(dk);
+      p7+=ds.pnl;
+      w7+=dk.slice(5)+':'+ds.total+'筆 '+(ds.pnl>=0?'+':'')+ds.pnl.toFixed(0)+'U\n';
+    }
+    tg('[Bybit] 📊 績效\n今日:'+dds.total+'筆 WR:'+(dds.total>0?(dds.wins/dds.total*100).toFixed(0):0)+'% PnL:'+(dds.pnl>=0?'+':'')+dds.pnl.toFixed(2)+'U\n\n7天:\n'+w7+'\n累計:'+al.total+'筆 WR:'+(al.total>0?(al.wins/al.total*100).toFixed(1):0)+'% PnL:'+(al.pnl>=0?'+':'')+al.pnl.toFixed(2)+'U',chatId);
     return;
   }
+
   if(cmd==='/history'){
     var tr=stats.trades.slice(-10).reverse();
-    if(!tr.length){tg('No trades',chatId);return;}
-    tg('[Bybit] Last 10\n'+tr.map(function(t){return (t.pnl>=0?'WIN':'LOSS')+' '+t.symbol+'\n'+(t.entry||0).toFixed(4)+'->'+(t.exit||0).toFixed(4)+' '+(t.pnl>=0?'+':'')+t.pnl.toFixed(2)+'U hold:'+(t.holdMin||0)+'m';}).join('\n'),chatId);
+    if(!tr.length){tg('尚無交易記錄',chatId);return;}
+    tg('[Bybit] 近10筆\n'+tr.map(function(t){return (t.pnl>=0?'✅ WIN':'❌ LOSS')+' '+t.symbol+'\n'+(t.entry||0).toFixed(4)+' -> '+(t.exit||0).toFixed(4)+' '+(t.pnl>=0?'+':'')+t.pnl.toFixed(2)+'U hold:'+(t.holdMin||0)+'min\n原因:'+t.reason;}).join('\n\n'),chatId);
     return;
   }
+
   if(cmd==='/set'){
-    if(args.length<2){tg('Usage: /set KEY VALUE',chatId);return;}
+    if(args.length<2){tg('用法: /set KEY VALUE',chatId);return;}
     var sk=args[0].toLowerCase(),sv=args[1],nv=parseFloat(sv);
-    if(sk==='amount'&&nv>0){cfg.tradeAmount=nv;tg('Amount -> '+nv+'U',chatId);}
-    else if(sk==='leverage'&&nv>=1&&nv<=20){cfg.leverage=nv;tg('Leverage -> '+nv+'x',chatId);}
-    else if(sk==='sl'&&nv>0){cfg.stopLossPercent=nv;tg('SL -> '+nv+'%',chatId);}
-    else if(sk==='tp'&&nv>0){cfg.takeProfitPercent=nv;tg('TP -> '+nv+'%',chatId);}
-    else if(sk==='tf'){if(['1m','3m','5m'].includes(sv)){cfg.timeframe=sv;tg('TF -> '+sv,chatId);}else tg('1m 3m 5m only',chatId);}
-    else if(sk==='oversold'&&nv>0&&nv<50){cfg.params.oversold=nv;tg('Oversold -> '+nv,chatId);}
-    else if(sk==='overbought'&&nv>50&&nv<100){cfg.params.overbought=nv;tg('Overbought -> '+nv,chatId);}
-    else if(sk==='volmul'&&nv>0){cfg.params.volMultiple=nv;tg('VolMultiple -> '+nv,chatId);}
-    else tg('Unknown: '+sk,chatId);
+    if(sk==='amount'&&nv>0){cfg.tradeAmount=nv;tg('✅ 每筆金額 -> '+nv+'U',chatId);}
+    else if(sk==='leverage'&&nv>=1&&nv<=20){cfg.leverage=nv;tg('✅ 槓桿 -> '+nv+'x',chatId);}
+    else if(sk==='sl'&&nv>0){cfg.stopLossPercent=nv;tg('✅ 止損 -> '+nv+'%',chatId);}
+    else if(sk==='tp'&&nv>0){cfg.takeProfitPercent=nv;tg('✅ 止盈 -> '+nv+'%',chatId);}
+    else if(sk==='tf'){if(['1m','3m','5m'].includes(sv)){cfg.timeframe=sv;tg('✅ 時框 -> '+sv,chatId);}else tg('只支援 1m 3m 5m',chatId);}
+    else if(sk==='threshold'&&nv>=1&&nv<=6){cfg.entryThreshold=Math.round(nv);tg('✅ 開單門檻 -> '+cfg.entryThreshold+'分',chatId);}
+    else if(sk==='oversold'&&nv>0&&nv<50){cfg.params.oversold=nv;tg('✅ 超賣線 -> '+nv,chatId);}
+    else if(sk==='overbought'&&nv>50&&nv<100){cfg.params.overbought=nv;tg('✅ 超買線 -> '+nv,chatId);}
+    else tg('未知設定: '+sk,chatId);
     return;
   }
+
   if(cmd==='/addsym'){
-    if(!args[0]){tg('Usage: /addsym SOLUSDT',chatId);return;}
+    if(!args[0]){tg('用法: /addsym SOLUSDT',chatId);return;}
     var as=args[0].toUpperCase();
-    if(cfg.symbols.includes(as)){tg(as+' exists',chatId);return;}
-    cfg.symbols.push(as);tg('Added '+as,chatId);return;
+    if(cfg.symbols.includes(as)){tg(as+' 已存在',chatId);return;}
+    cfg.symbols.push(as);tg('✅ 新增 '+as,chatId);return;
   }
+
   if(cmd==='/delsym'){
-    if(!args[0]){tg('Usage: /delsym SOLUSDT',chatId);return;}
+    if(!args[0]){tg('用法: /delsym SOLUSDT',chatId);return;}
     cfg.symbols=cfg.symbols.filter(function(s){return s!==args[0].toUpperCase();});
-    tg('Removed '+args[0].toUpperCase(),chatId);return;
+    tg('✅ 移除 '+args[0].toUpperCase(),chatId);return;
   }
-  if(text.startsWith('/')){tg('Unknown. Use /help',chatId);}
+
+  if(text.startsWith('/')){tg('未知指令，輸入 /help 查看',chatId);}
 }
+
 function startServer(){
   var PORT=process.env.BYBIT_PORT||3001;
   http.createServer(function(req,res){
     res.writeHead(200,{'Content-Type':'application/json'});
-    res.end(JSON.stringify({status:'ok',running:cfg.botRunning,learnCount:brain.learnCount,uptime:Math.round((Date.now()-startTime)/60000)+'min'}));
+    res.end(JSON.stringify({status:'ok',running:cfg.botRunning,learnCount:brain.learnCount,uptime:Math.round((Date.now()-startTime)/60000)+'min',threshold:cfg.entryThreshold}));
   }).listen(PORT,function(){log('OK','Server Port:'+PORT);});
 }
+
 function scheduleReport(){
   function ms10(){var now=new Date(),tw=new Date(now.toLocaleString('en-US',{timeZone:'Asia/Taipei'}));var n=new Date(tw);n.setHours(10,0,0,0);if(tw.getHours()>=10)n.setDate(n.getDate()+1);return n-tw;}
   setTimeout(function(){
     var d=getDayStat(),all=stats.allTime;
-    tg('[Bybit 海馬] 每日報告\n今日:'+d.total+'次 WR:'+(d.total>0?(d.wins/d.total*100).toFixed(1):0)+'% PnL:'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'U\n最佳時段:'+(brain.bestHours.join(',')||'學習中')+'\n最佳品種:'+(brain.bestSymbols.join(',')||'學習中')+'\n累計:'+all.total+'次 PnL:'+(all.pnl>=0?'+':'')+all.pnl.toFixed(2)+'U');
-    setInterval(function(){var d2=getDayStat(),all2=stats.allTime;tg('[Bybit 海馬] 每日報告\n今日:'+d2.total+'次 WR:'+(d2.total>0?(d2.wins/d2.total*100).toFixed(1):0)+'% PnL:'+(d2.pnl>=0?'+':'')+d2.pnl.toFixed(2)+'U\n累計:'+all2.total+'次 PnL:'+(all2.pnl>=0?'+':'')+all2.pnl.toFixed(2)+'U');},24*60*60*1000);
+    tg('[Bybit 海馬] 📊 每日報告\n今日:'+d.total+'筆 WR:'+(d.total>0?(d.wins/d.total*100).toFixed(1):0)+'% PnL:'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'U\n最佳時段:'+(brain.bestHours.join(',')||'學習中')+'\n最佳品種:'+(brain.bestSymbols.join(',')||'學習中')+'\n累計:'+all.total+'筆 PnL:'+(all.pnl>=0?'+':'')+all.pnl.toFixed(2)+'U');
+    setInterval(function(){
+      var d2=getDayStat(),all2=stats.allTime;
+      tg('[Bybit 海馬] 📊 每日報告\n今日:'+d2.total+'筆 WR:'+(d2.total>0?(d2.wins/d2.total*100).toFixed(1):0)+'% PnL:'+(d2.pnl>=0?'+':'')+d2.pnl.toFixed(2)+'U\n累計:'+all2.total+'筆 PnL:'+(all2.pnl>=0?'+':'')+all2.pnl.toFixed(2)+'U');
+    },24*60*60*1000);
   },ms10());
 }
+
 async function main(){
-  console.log('\nBybit Seahorse AutoTrader v1.0\n');
+  console.log('\nBybit Seahorse AutoTrader v2.0\n');
   log('INFO','Starting...');
   startServer();
   try{
     var bal=await getBalance();
     log('OK','Bybit API OK! Available:'+bal.available.toFixed(2)+'U');
-    tg('[Bybit 海馬] Online!\nBalance:'+bal.available.toFixed(2)+'U\nSelf-Learning: ON\n/help 查看指令');
-  }catch(e){log('ERROR','API fail: '+e.message);tg('[Bybit] Warning: '+e.message);}
+    tg('[Bybit 海馬 v2.0] 🟢 上線!\n餘額:'+bal.available.toFixed(2)+'U\nSelf-Learning: ON ✅\n/help 查看指令');
+  }catch(e){log('ERROR','API fail: '+e.message);tg('[Bybit] ⚠️ Warning: '+e.message);}
   log('INFO','Starting Telegram polling...');
   tgPoll();
   scheduleReport();
   log('OK','Ready. /help');
 }
-process.on('uncaughtException',function(e){log('ERROR','Uncaught: '+e.message);});
-process.on('unhandledRejection',function(e){log('ERROR','Unhandled: '+e);});
+
+process.on('uncaughtException',function(e){log('ERROR','Uncaught: '+e.message);tg('[Bybit] ⚠️ 程式異常: '+e.message);});
+process.on('unhandledRejection',function(e){log('ERROR','Unhandled: '+(e&&e.message?e.message:String(e)));});
 main().catch(function(e){log('ERROR','Start fail: '+e.message);process.exit(1);});
