@@ -202,8 +202,10 @@ async function runSeahorse(sym){
 
   if(brain.worstSymbols.includes(sym)){log('AI',sym+' 迴避品種，跳過');return null;}
 
+  log('INFO',sym+' 開始掃描...');
   var kl=await getKlines(sym,cfg.timeframe,120);
-  if(kl.length<50)return null;
+  log('INFO',sym+' K線數量:'+kl.length);
+  if(kl.length<50){log('WARN',sym+' K線不足 '+kl.length+'/50');return null;}
 
   var closes=kl.map(function(k){return parseFloat(k[4]);}).reverse();
   var highs=kl.map(function(k){return parseFloat(k[2]);}).reverse();
@@ -538,6 +540,31 @@ async function main(){
   log('OK','Ready. /help');
 }
 
-process.on('uncaughtException',function(e){log('ERROR','Uncaught: '+e.message);tg('[Bybit] ⚠️ 程式異常: '+e.message);});
-process.on('unhandledRejection',function(e){log('ERROR','Unhandled: '+(e&&e.message?e.message:String(e)));});
-main().catch(function(e){log('ERROR','Start fail: '+e.message);process.exit(1);});
+process.on('uncaughtException',function(e){log('ERROR','Uncaught: '+e.message);tg('🚨 Bybit 海馬 程式異常!\n錯誤: '+e.message+'\n請重新啟動 node bybit_trader.js');});
+process.on('unhandledRejection',function(e){log('ERROR','Unhandled: '+(e&&e.message?e.message:String(e)));tg('🚨 Bybit 海馬 未處理錯誤!\n'+(e&&e.message?e.message:String(e))+'\n請重新啟動 node bybit_trader.js');});
+
+// ✅ 程式正常關閉通知（Ctrl+C）
+process.on('SIGINT',function(){
+  log('INFO','程式被手動關閉');
+  tg('⛔ Bybit 海馬 已關閉!\n原因: 手動停止 (Ctrl+C)\n持倉狀態: '+Object.keys(openTrades).length+'個未平倉\n請記得重新啟動!');
+  setTimeout(function(){process.exit(0);},2000);
+});
+
+// ✅ 程式異常退出通知
+process.on('SIGTERM',function(){
+  log('INFO','程式被系統終止');
+  tg('⛔ Bybit 海馬 被系統終止!\n持倉狀態: '+Object.keys(openTrades).length+'個未平倉\n請重新啟動 node bybit_trader.js');
+  setTimeout(function(){process.exit(0);},2000);
+});
+
+// ✅ 定時心跳確認（每整點確認程式還活著）
+setInterval(function(){
+  if(!cfg.botRunning)return;
+  var d=getDayStat(),pos=Object.keys(openTrades).length;
+  var hr=new Date().getMinutes();
+  if(hr===0){
+    tg('💓 Bybit 心跳確認\n🟢 程式運行中\n今日:'+d.total+'筆 PnL:'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'U\n持倉:'+pos+'個');
+  }
+},60000);
+
+main().catch(function(e){log('ERROR','Start fail: '+e.message);tg('🚨 Bybit 海馬 啟動失敗!\n錯誤: '+e.message);process.exit(1);});
