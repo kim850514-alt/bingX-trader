@@ -1,600 +1,567 @@
-"""
-SIREN/USDT BingX 剝頭皮機器人 + Telegram 回報版
-策略 A：區間邊緣反彈
-策略 B：假突破反向單
-全自動下單，Telegram 接收所有通知
-"""
+/**
+ * SIREN/USDT BingX 剝頭皮機器人 + Telegram 回報
+ * 策略 A：區間邊緣反彈
+ * 策略 B：假突破反向單
+ * 全自動下單，Telegram 接收所有通知
+ *
+ * 執行：node bot.js
+ */
 
-import hashlib
-import hmac
-import time
-import json
-import logging
-import os
-import threading
-import requests
-import pandas as pd
-import numpy as np
-from datetime import datetime
-from pathlib import Path
+const https = require("https");
+const http  = require("http");
+const fs    = require("fs");
+const path  = require("path");
+const crypto = require("crypto");
 
-# ════════════════════════════════════════════
-#  設定（啟動前填好環境變數）
-# ════════════════════════════════════════════
-SYMBOL            = "SIREN-USDT"
-LEVERAGE          = 3
-POSITION_USDT     = 20        # 每筆下注 USDT
-MAX_DAILY_TRADES  = 3
-MAX_DAILY_LOSSES  = 2
-LOOP_INTERVAL_SEC = 30        # 掃描間隔（秒）
+// ════════════════════════════════════════════
+//  設定（直接填在這裡，或用環境變數）
+// ════════════════════════════════════════════
+const CONFIG = {
+  BINGX_API_KEY:    process.env.BINGX_API_KEY    || "YOUR_BINGX_API_KEY",
+  BINGX_SECRET_KEY: process.env.BINGX_SECRET_KEY || "YOUR_BINGX_SECRET",
+  TELEGRAM_TOKEN:   process.env.TELEGRAM_TOKEN   || "YOUR_TG_TOKEN",
+  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || "YOUR_CHAT_ID",
 
-PARAMS = {
-    "range_lookback":  30,
-    "edge_threshold":  0.008,
-    "sl_pct":          0.012,
-    "tp_pct":          0.022,
-    "fakeout_candles": 3,
-    "min_volume_ratio":0.5,
+  SYMBOL:            "SIREN-USDT",
+  LEVERAGE:          3,
+  POSITION_USDT:     20,
+  MAX_DAILY_TRADES:  3,
+  MAX_DAILY_LOSSES:  2,
+  LOOP_INTERVAL_MS:  30_000,   // 30 秒掃描一次
+};
+
+// 策略參數（學習模組會自動調整）
+let PARAMS = {
+  range_lookback:   30,
+  edge_threshold:   0.008,
+  sl_pct:           0.012,
+  tp_pct:           0.022,
+  fakeout_candles:  3,
+  min_volume_ratio: 0.5,
+};
+
+const BINGX_BASE  = "open-api.bingx.com";
+const LOG_DIR     = "logs";
+const DATA_DIR    = "data";
+
+// ── 目錄建立 ───────────────────────────────
+[LOG_DIR, DATA_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d); });
+
+// ── 日誌 ────────────────────────────────────
+const logFile = path.join(LOG_DIR, `bot_${new Date().toISOString().slice(0,10)}.log`);
+function log(level, msg) {
+  const line = `${new Date().toISOString()} [${level}] ${msg}`;
+  console.log(line);
+  fs.appendFileSync(logFile, line + "\n");
+}
+const info  = m => log("INFO",  m);
+const warn  = m => log("WARN",  m);
+const error = m => log("ERROR", m);
+
+// ════════════════════════════════════════════
+//  HTTP 工具
+// ════════════════════════════════════════════
+function httpRequest(options, body = null) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, res => {
+      let data = "";
+      res.on("data", chunk => data += chunk);
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); }
+        catch { resolve(data); }
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error("timeout")); });
+    if (body) req.write(body);
+    req.end();
+  });
 }
 
-BASE_URL  = "https://open-api.bingx.com"
-LOG_DIR   = Path("logs")
-DATA_DIR  = Path("data")
-LOG_DIR.mkdir(exist_ok=True)
-DATA_DIR.mkdir(exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / f"bot_{datetime.now().strftime('%Y%m%d')}.log"),
-        logging.StreamHandler(),
-    ],
-)
-log = logging.getLogger(__name__)
-
-
-# ════════════════════════════════════════════
-#  Telegram 通知模組
-# ════════════════════════════════════════════
-class TelegramNotifier:
-    def __init__(self, token: str, chat_id: str):
-        self.token   = token
-        self.chat_id = chat_id
-        self.base    = f"https://api.telegram.org/bot{token}"
-
-    def send(self, text: str, parse_mode: str = "HTML") -> bool:
-        try:
-            r = requests.post(
-                f"{self.base}/sendMessage",
-                json={"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode},
-                timeout=10,
-            )
-            return r.ok
-        except Exception as e:
-            log.error(f"[TG] 發送失敗: {e}")
-            return False
-
-    # ── 通知模板 ──────────────────────────────
-    def notify_start(self, params: dict):
-        self.send(
-            "🤖 <b>SIREN 機器人已啟動</b>\n"
-            f"幣種：<code>{SYMBOL}</code>\n"
-            f"槓桿：{LEVERAGE}x｜每筆：{POSITION_USDT} USDT\n"
-            f"每日上限：{MAX_DAILY_TRADES} 筆｜連虧停手：{MAX_DAILY_LOSSES} 筆\n"
-            f"止損：{params['sl_pct']:.1%}｜止盈：{params['tp_pct']:.1%}"
-        )
-
-    def notify_signal(self, strategy: str, direction: str, price: float,
-                      support: float, resistance: float, funding: float):
-        emoji = "🟢" if direction == "BULLISH" else "🔴"
-        side  = "做多 LONG" if direction == "BULLISH" else "做空 SHORT"
-        self.send(
-            f"{emoji} <b>訊號觸發 — 策略 {strategy}</b>\n"
-            f"方向：{side}\n"
-            f"進場價：<code>{price:.5f}</code>\n"
-            f"支撐：<code>{support:.5f}</code>  壓力：<code>{resistance:.5f}</code>\n"
-            f"資金費率：{funding:.4%}"
-        )
-
-    def notify_entry(self, strategy: str, side: str, price: float,
-                     tp: float, sl: float, qty: float):
-        emoji = "🟢" if side == "BUY" else "🔴"
-        self.send(
-            f"{emoji} <b>已進場 — 策略 {strategy}</b>\n"
-            f"方向：{'LONG' if side=='BUY' else 'SHORT'}\n"
-            f"成交價：<code>{price:.5f}</code>\n"
-            f"止盈：<code>{tp:.5f}</code>\n"
-            f"止損：<code>{sl:.5f}</code>\n"
-            f"數量：{qty:.4f}"
-        )
-
-    def notify_close(self, result: str, pnl_pct: float,
-                     daily_trades: int, daily_losses: int):
-        if result == "WIN":
-            emoji, label = "✅", "獲利"
-        elif result == "LOSS":
-            emoji, label = "❌", "虧損"
-        else:
-            emoji, label = "➖", "平手"
-        self.send(
-            f"{emoji} <b>已出場 — {label}</b>\n"
-            f"PnL：<code>{pnl_pct:+.2%}</code>\n"
-            f"今日：{daily_trades}/{MAX_DAILY_TRADES} 筆｜連虧：{daily_losses} 次"
-        )
-
-    def notify_pause(self, reason: str):
-        self.send(f"⏸ <b>暫停交易</b>\n原因：{reason}")
-
-    def notify_resume(self):
-        self.send("▶️ <b>恢復交易監控</b>")
-
-    def notify_daily_summary(self, trades: list):
-        if not trades:
-            self.send("📊 <b>今日無交易</b>")
-            return
-        df    = pd.DataFrame(trades)
-        wins  = (df["result"] == "WIN").sum()
-        total = len(df)
-        avg   = df["pnl_pct"].mean()
-        self.send(
-            "📊 <b>今日交易摘要</b>\n"
-            f"筆數：{total}｜勝：{wins}｜敗：{total-wins}\n"
-            f"勝率：{wins/total:.0%}｜平均PnL：{avg:+.2%}"
-        )
-
-    def notify_learning(self, win_rate: float, avg_pnl: float,
-                        old_params: dict, new_params: dict):
-        changes = []
-        for k in ["edge_threshold", "tp_pct", "sl_pct"]:
-            if abs(old_params[k] - new_params[k]) > 1e-6:
-                changes.append(f"  {k}: {old_params[k]:.4f} → {new_params[k]:.4f}")
-        change_text = "\n".join(changes) if changes else "  無調整"
-        self.send(
-            "🧠 <b>學習模組更新</b>\n"
-            f"近期勝率：{win_rate:.0%}｜平均PnL：{avg_pnl:+.2%}\n"
-            f"參數變動：\n{change_text}"
-        )
-
-    def notify_error(self, error: str):
-        self.send(f"⚠️ <b>錯誤</b>\n<code>{error[:300]}</code>")
-
-
-# ════════════════════════════════════════════
-#  BingX API 客戶端
-# ════════════════════════════════════════════
-class BingXClient:
-    def __init__(self, api_key: str, secret_key: str):
-        self.api_key    = api_key
-        self.secret_key = secret_key
-
-    def _sign(self, params: dict) -> str:
-        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        return hmac.new(
-            self.secret_key.encode(), query.encode(), hashlib.sha256
-        ).hexdigest()
-
-    def _get(self, path: str, params: dict = None) -> dict:
-        params = params or {}
-        params["timestamp"] = int(time.time() * 1000)
-        params["signature"] = self._sign(params)
-        r = requests.get(
-            BASE_URL + path,
-            params=params,
-            headers={"X-BX-APIKEY": self.api_key},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
-
-    def _post(self, path: str, params: dict = None) -> dict:
-        params = params or {}
-        params["timestamp"] = int(time.time() * 1000)
-        params["signature"] = self._sign(params)
-        r = requests.post(
-            BASE_URL + path,
-            params=params,
-            headers={"X-BX-APIKEY": self.api_key},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
-
-    def get_klines(self, symbol: str, interval: str = "1m", limit: int = 100) -> list:
-        data = self._get("/openApi/swap/v3/quote/klines", {
-            "symbol": symbol, "interval": interval, "limit": limit,
-        })
-        return data.get("data", [])
-
-    def get_ticker(self, symbol: str) -> dict:
-        data = self._get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
-        return data.get("data", {})
-
-    def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> dict:
-        return self._post("/openApi/swap/v2/trade/leverage", {
-            "symbol": symbol, "side": side, "leverage": leverage,
-        })
-
-    def place_order(self, symbol: str, side: str, quantity: float,
-                    tp_price: float = None, sl_price: float = None) -> dict:
-        params = {
-            "symbol":       symbol,
-            "side":         side,
-            "positionSide": "LONG" if side == "BUY" else "SHORT",
-            "type":         "MARKET",
-            "quantity":     round(quantity, 4),
-        }
-        if tp_price:
-            params["takeProfit"] = json.dumps({
-                "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": round(tp_price, 6),
-                "workingType": "MARK_PRICE",
-            })
-        if sl_price:
-            params["stopLoss"] = json.dumps({
-                "type": "STOP_MARKET",
-                "stopPrice": round(sl_price, 6),
-                "workingType": "MARK_PRICE",
-            })
-        return self._post("/openApi/swap/v2/trade/order", params)
-
-    def get_positions(self, symbol: str) -> list:
-        data = self._get("/openApi/swap/v2/user/positions", {"symbol": symbol})
-        return data.get("data", [])
-
-    def get_funding_rate(self, symbol: str) -> float:
-        try:
-            data = self._get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
-            return float(data["data"]["lastFundingRate"])
-        except Exception:
-            return 0.0
-
-
-# ════════════════════════════════════════════
-#  技術分析
-# ════════════════════════════════════════════
-def parse_klines(raw: list) -> pd.DataFrame:
-    df = pd.DataFrame(raw, columns=[
-        "open_time","open","high","low","close","volume","close_time"
-    ])
-    for col in ["open","high","low","close","volume"]:
-        df[col] = df[col].astype(float)
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    return df.sort_values("open_time").reset_index(drop=True)
-
-def find_range(df: pd.DataFrame, lookback: int) -> tuple[float, float]:
-    recent = df.tail(lookback)
-    return recent["low"].min(), recent["high"].max()
-
-def is_consolidating(df: pd.DataFrame, lookback: int, threshold: float = 0.08) -> bool:
-    support, resistance = find_range(df, lookback)
-    if support == 0:
-        return False
-    return (resistance - support) / support < threshold
-
-def detect_reversal_candle(df: pd.DataFrame) -> str | None:
-    if len(df) < 2:
-        return None
-    last, prev = df.iloc[-1], df.iloc[-2]
-    body        = abs(last["close"] - last["open"])
-    total       = last["high"] - last["low"]
-    if total == 0:
-        return None
-    lower_wick = min(last["open"], last["close"]) - last["low"]
-    upper_wick = last["high"] - max(last["open"], last["close"])
-    if lower_wick > 2 * body and lower_wick > upper_wick:
-        return "BULLISH"
-    if upper_wick > 2 * body and upper_wick > lower_wick:
-        return "BEARISH"
-    if (last["close"] > last["open"] and prev["close"] < prev["open"] and
-            last["close"] > prev["open"] and last["open"] < prev["close"]):
-        return "BULLISH"
-    if (last["close"] < last["open"] and prev["close"] > prev["open"] and
-            last["close"] < prev["open"] and last["open"] > prev["close"]):
-        return "BEARISH"
-    return None
-
-def detect_fakeout(df_1m: pd.DataFrame, support: float, resistance: float,
-                   lookback_candles: int = 3) -> str | None:
-    if len(df_1m) < lookback_candles + 1:
-        return None
-    recent    = df_1m.tail(lookback_candles + 1)
-    last      = df_1m.iloc[-1]
-    broke_up   = recent["high"].max() > resistance
-    broke_down = recent["low"].min()  < support
-    in_range   = support <= last["close"] <= resistance
-    if broke_up   and in_range:
-        return "BEARISH"
-    if broke_down and in_range:
-        return "BULLISH"
-    return None
-
-def volume_ok(df: pd.DataFrame, ratio: float = 0.5) -> bool:
-    if len(df) < 20:
-        return True
-    return df["volume"].iloc[-1] >= df["volume"].tail(20).mean() * ratio
-
-
-# ════════════════════════════════════════════
-#  學習模組
-# ════════════════════════════════════════════
-class LearningModule:
-    TRADE_FILE = DATA_DIR / "trades.json"
-
-    def __init__(self):
-        self.trades: list[dict] = self._load()
-
-    def _load(self) -> list:
-        if self.TRADE_FILE.exists():
-            with open(self.TRADE_FILE) as f:
-                return json.load(f)
-        return []
-
-    def _save(self):
-        with open(self.TRADE_FILE, "w") as f:
-            json.dump(self.trades, f, indent=2, default=str)
-
-    def record(self, **kwargs):
-        self.trades.append({"time": datetime.utcnow().isoformat(), **kwargs})
-        self._save()
-
-    def today_trades(self) -> list:
-        today = datetime.utcnow().date().isoformat()
-        return [t for t in self.trades if t["time"].startswith(today)]
-
-    def analyze(self, params: dict, notifier: "TelegramNotifier") -> dict:
-        if len(self.trades) < 10:
-            return params
-        recent   = self.trades[-30:]
-        df       = pd.DataFrame(recent)
-        win_rate = (df["result"] == "WIN").mean()
-        avg_pnl  = df["pnl_pct"].mean()
-        old      = params.copy()
-        new      = params.copy()
-
-        if win_rate < 0.40:
-            new["edge_threshold"] = max(0.004, params["edge_threshold"] * 0.85)
-        if win_rate > 0.60 and avg_pnl > 0:
-            new["tp_pct"] = min(0.04, params["tp_pct"] * 1.1)
-
-        with open(DATA_DIR / "params.json", "w") as f:
-            json.dump(new, f, indent=2)
-
-        notifier.notify_learning(win_rate, avg_pnl, old, new)
-        return new
-
-
-# ════════════════════════════════════════════
-#  主機器人
-# ════════════════════════════════════════════
-class SirenBot:
-    def __init__(self):
-        api_key    = os.getenv("BINGX_API_KEY",    "YOUR_BINGX_API_KEY")
-        secret_key = os.getenv("BINGX_SECRET_KEY", "YOUR_BINGX_SECRET")
-        tg_token   = os.getenv("TELEGRAM_TOKEN",   "YOUR_TG_TOKEN")
-        tg_chat    = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-
-        self.client   = BingXClient(api_key, secret_key)
-        self.tg       = TelegramNotifier(tg_token, tg_chat)
-        self.learner  = LearningModule()
-        self.params   = self._load_params()
-
-        self.daily_trades = 0
-        self.daily_losses = 0
-        self.in_position  = False
-        self.current      = {}
-
-    def _load_params(self) -> dict:
-        path = DATA_DIR / "params.json"
-        if path.exists():
-            with open(path) as f:
-                PARAMS.update(json.load(f))
-        return PARAMS
-
-    # ── 風控守門 ──────────────────────────────
-    def _can_trade(self) -> tuple[bool, str]:
-        if self.in_position:
-            return False, "持倉中"
-        if self.daily_trades >= MAX_DAILY_TRADES:
-            return False, f"已達每日上限 {MAX_DAILY_TRADES} 筆"
-        if self.daily_losses >= MAX_DAILY_LOSSES:
-            return False, f"連虧 {self.daily_losses} 次，停手"
-        now = datetime.utcnow()
-        h, m = now.hour, now.minute
-        for settle_h in [0, 8, 16]:
-            if h == settle_h and m < 15:
-                return False, f"資金費率結算時段 {settle_h:02d}:00 UTC"
-            if h == (settle_h - 1) % 24 and m >= 45:
-                return False, "資金費率結算前 15 分鐘"
-        return True, ""
-
-    # ── 掃描一次 ──────────────────────────────
-    def run_once(self):
-        try:
-            klines_15m = self.client.get_klines(SYMBOL, "15m", 60)
-            klines_1m  = self.client.get_klines(SYMBOL, "1m",  20)
-            ticker     = self.client.get_ticker(SYMBOL)
-            if not klines_15m or not klines_1m or not ticker:
-                return
-
-            df_15m = parse_klines(klines_15m)
-            df_1m  = parse_klines(klines_1m)
-            price  = float(ticker.get("lastPrice", 0))
-            if price == 0:
-                return
-
-            if not is_consolidating(df_15m, self.params["range_lookback"]):
-                log.info(f"非盤整 price={price:.5f}")
-                return
-
-            support, resistance = find_range(df_15m, self.params["range_lookback"])
-
-            if not volume_ok(df_1m, self.params["min_volume_ratio"]):
-                log.info("量能不足，略過")
-                return
-
-            funding = self.client.get_funding_rate(SYMBOL)
-            can, reason = self._can_trade()
-            if not can:
-                log.info(f"風控：{reason}")
-                return
-
-            # 策略 B：假突破優先
-            fakeout = detect_fakeout(df_1m, support, resistance,
-                                     self.params["fakeout_candles"])
-            if fakeout:
-                log.info(f"策略B 假突破訊號: {fakeout}")
-                self.tg.notify_signal("B", fakeout, price, support, resistance, funding)
-                self._enter(fakeout, price, support, resistance, "B", funding)
-                return
-
-            # 策略 A：邊緣反彈
-            near_sup = (price - support)    / support < self.params["edge_threshold"]
-            near_res = (resistance - price) / price   < self.params["edge_threshold"]
-
-            if near_sup:
-                sig = detect_reversal_candle(df_1m)
-                if sig == "BULLISH" and funding <= 0.0005:
-                    self.tg.notify_signal("A", sig, price, support, resistance, funding)
-                    self._enter(sig, price, support, resistance, "A", funding)
-            elif near_res:
-                sig = detect_reversal_candle(df_1m)
-                if sig == "BEARISH" and funding >= -0.0003:
-                    self.tg.notify_signal("A", sig, price, support, resistance, funding)
-                    self._enter(sig, price, support, resistance, "A", funding)
-
-        except Exception as e:
-            log.error(f"run_once 錯誤: {e}", exc_info=True)
-            self.tg.notify_error(str(e))
-
-    # ── 進場 ──────────────────────────────────
-    def _enter(self, direction: str, price: float,
-               support: float, resistance: float,
-               strategy: str, funding: float):
-        is_long  = direction == "BULLISH"
-        side     = "BUY" if is_long else "SELL"
-        sl_price = price * (1 - self.params["sl_pct"]) if is_long else price * (1 + self.params["sl_pct"])
-        tp_price = price * (1 + self.params["tp_pct"]) if is_long else price * (1 - self.params["tp_pct"])
-        qty      = round(POSITION_USDT * LEVERAGE / price, 4)
-
-        try:
-            self.client.set_leverage(SYMBOL, LEVERAGE, "LONG" if is_long else "SHORT")
-            result = self.client.place_order(SYMBOL, side, qty, tp_price, sl_price)
-            log.info(f"進場成功 {strategy} {side} qty={qty} result={result}")
-
-            self.tg.notify_entry(strategy, side, price, tp_price, sl_price, qty)
-
-            self.in_position  = True
-            self.daily_trades += 1
-            self.current = {
-                "strategy": strategy,
-                "side":     side,
-                "entry":    price,
-                "tp":       tp_price,
-                "sl":       sl_price,
-                "funding":  funding,
-                "time":     time.time(),
-            }
-        except Exception as e:
-            log.error(f"下單失敗: {e}", exc_info=True)
-            self.tg.notify_error(f"下單失敗: {e}")
-
-    # ── 監控倉位 ──────────────────────────────
-    def check_position(self):
-        if not self.in_position:
-            return
-        try:
-            positions = self.client.get_positions(SYMBOL)
-            active    = [p for p in positions if float(p.get("positionAmt", 0)) != 0]
-            if active:
-                return  # 還在倉，繼續等
-
-            # 倉位已平
-            ticker  = self.client.get_ticker(SYMBOL)
-            price   = float(ticker.get("lastPrice", self.current["entry"]))
-            entry   = self.current["entry"]
-            is_long = self.current["side"] == "BUY"
-            pnl_pct = (price - entry) / entry * (1 if is_long else -1)
-            result  = "WIN" if pnl_pct > 0.001 else ("LOSS" if pnl_pct < -0.001 else "BREAKEVEN")
-
-            if result == "LOSS":
-                self.daily_losses += 1
-            else:
-                self.daily_losses = 0
-
-            self.learner.record(
-                strategy     = self.current["strategy"],
-                side         = self.current["side"],
-                entry        = entry,
-                tp           = self.current["tp"],
-                sl           = self.current["sl"],
-                result       = result,
-                pnl_pct      = pnl_pct,
-                funding_rate = self.current["funding"],
-            )
-
-            self.tg.notify_close(result, pnl_pct, self.daily_trades, self.daily_losses)
-
-            # 每 20 筆學習一次
-            if len(self.learner.trades) % 20 == 0:
-                self.params = self.learner.analyze(self.params, self.tg)
-
-            # 連虧達上限，通知暫停
-            if self.daily_losses >= MAX_DAILY_LOSSES:
-                self.tg.notify_pause(f"連虧 {self.daily_losses} 次達上限，今日停手")
-
-            self.in_position = False
-            self.current     = {}
-
-        except Exception as e:
-            log.error(f"check_position 錯誤: {e}", exc_info=True)
-            self.tg.notify_error(str(e))
-
-    # ── 每日摘要（UTC 23:55 發送）─────────────
-    def _daily_summary_scheduler(self):
-        while True:
-            now = datetime.utcnow()
-            if now.hour == 23 and now.minute == 55:
-                self.tg.notify_daily_summary(self.learner.today_trades())
-                time.sleep(120)  # 避免重複發送
-            time.sleep(30)
-
-    # ── 主迴圈 ────────────────────────────────
-    def run_forever(self):
-        self.tg.notify_start(self.params)
-        log.info("機器人啟動")
-
-        # 每日摘要執行緒
-        t = threading.Thread(target=self._daily_summary_scheduler, daemon=True)
-        t.start()
-
-        last_reset_day = datetime.utcnow().day
-
-        while True:
-            try:
-                today = datetime.utcnow().day
-                if today != last_reset_day:
-                    self.daily_trades = 0
-                    self.daily_losses = 0
-                    last_reset_day    = today
-                    log.info("每日計數器已重置")
-                    self.tg.notify_resume()
-
-                self.check_position()
-                if not self.in_position:
-                    self.run_once()
-
-                time.sleep(LOOP_INTERVAL_SEC)
-
-            except KeyboardInterrupt:
-                self.tg.send("🛑 <b>機器人已手動停止</b>")
-                log.info("使用者中斷")
-                break
-            except Exception as e:
-                log.error(f"主迴圈錯誤: {e}", exc_info=True)
-                self.tg.notify_error(str(e))
-                time.sleep(60)
-
-
-if __name__ == "__main__":
-    SirenBot().run_forever()
+// ════════════════════════════════════════════
+//  Telegram 通知
+// ════════════════════════════════════════════
+async function tgSend(text) {
+  try {
+    const body = JSON.stringify({
+      chat_id: CONFIG.TELEGRAM_CHAT_ID,
+      text,
+      parse_mode: "HTML",
+    });
+    await httpRequest({
+      hostname: "api.telegram.org",
+      path:     `/bot${CONFIG.TELEGRAM_TOKEN}/sendMessage`,
+      method:   "POST",
+      headers:  { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+    }, body);
+  } catch(e) {
+    error(`TG 發送失敗: ${e.message}`);
+  }
+}
+
+const TG = {
+  start: (p) => tgSend(
+    `🤖 <b>SIREN 機器人已啟動</b>\n` +
+    `幣種：<code>${CONFIG.SYMBOL}</code>\n` +
+    `槓桿：${CONFIG.LEVERAGE}x｜每筆：${CONFIG.POSITION_USDT} USDT\n` +
+    `每日上限：${CONFIG.MAX_DAILY_TRADES} 筆｜連虧停手：${CONFIG.MAX_DAILY_LOSSES} 筆\n` +
+    `止損：${(p.sl_pct*100).toFixed(1)}%｜止盈：${(p.tp_pct*100).toFixed(1)}%`
+  ),
+  signal: (strategy, dir, price, sup, res, funding) => tgSend(
+    `${dir==="BULLISH"?"🟢":"🔴"} <b>訊號觸發 — 策略 ${strategy}</b>\n` +
+    `方向：${dir==="BULLISH"?"做多 LONG":"做空 SHORT"}\n` +
+    `進場價：<code>${price.toFixed(5)}</code>\n` +
+    `支撐：<code>${sup.toFixed(5)}</code>  壓力：<code>${res.toFixed(5)}</code>\n` +
+    `資金費率：${(funding*100).toFixed(4)}%`
+  ),
+  entry: (strategy, side, price, tp, sl, qty) => tgSend(
+    `${side==="BUY"?"🟢":"🔴"} <b>已進場 — 策略 ${strategy}</b>\n` +
+    `方向：${side==="BUY"?"LONG":"SHORT"}\n` +
+    `成交價：<code>${price.toFixed(5)}</code>\n` +
+    `止盈：<code>${tp.toFixed(5)}</code>\n` +
+    `止損：<code>${sl.toFixed(5)}</code>\n` +
+    `數量：${qty.toFixed(4)}`
+  ),
+  close: (result, pnlPct, dailyTrades, dailyLosses) => {
+    const [emoji, label] = result==="WIN" ? ["✅","獲利"] : result==="LOSS" ? ["❌","虧損"] : ["➖","平手"];
+    return tgSend(
+      `${emoji} <b>已出場 — ${label}</b>\n` +
+      `PnL：<code>${(pnlPct>=0?"+":"")+(pnlPct*100).toFixed(2)}%</code>\n` +
+      `今日：${dailyTrades}/${CONFIG.MAX_DAILY_TRADES} 筆｜連虧：${dailyLosses} 次`
+    );
+  },
+  pause:  reason  => tgSend(`⏸ <b>暫停交易</b>\n原因：${reason}`),
+  resume: ()      => tgSend(`▶️ <b>恢復交易監控</b>`),
+  error:  msg     => tgSend(`⚠️ <b>錯誤</b>\n<code>${String(msg).slice(0,300)}</code>`),
+  learning: (wr, avg, oldP, newP) => {
+    const changes = ["edge_threshold","tp_pct","sl_pct"]
+      .filter(k => Math.abs(oldP[k]-newP[k]) > 1e-6)
+      .map(k => `  ${k}: ${oldP[k].toFixed(4)} → ${newP[k].toFixed(4)}`)
+      .join("\n") || "  無調整";
+    return tgSend(
+      `🧠 <b>學習模組更新</b>\n` +
+      `近期勝率：${(wr*100).toFixed(0)}%｜平均PnL：${(avg>=0?"+":"")+(avg*100).toFixed(2)}%\n` +
+      `參數變動：\n${changes}`
+    );
+  },
+  dailySummary: (trades) => {
+    if (!trades.length) return tgSend("📊 <b>今日無交易</b>");
+    const wins = trades.filter(t=>t.result==="WIN").length;
+    const avg  = trades.reduce((s,t)=>s+t.pnl_pct,0)/trades.length;
+    return tgSend(
+      `📊 <b>今日交易摘要</b>\n` +
+      `筆數：${trades.length}｜勝：${wins}｜敗：${trades.length-wins}\n` +
+      `勝率：${Math.round(wins/trades.length*100)}%｜平均PnL：${(avg>=0?"+":"")+(avg*100).toFixed(2)}%`
+    );
+  },
+};
+
+// ════════════════════════════════════════════
+//  BingX API
+// ════════════════════════════════════════════
+function bingxSign(params) {
+  const query = Object.keys(params).sort().map(k=>`${k}=${params[k]}`).join("&");
+  return crypto.createHmac("sha256", CONFIG.BINGX_SECRET_KEY).update(query).digest("hex");
+}
+
+async function bingxGet(path_, params = {}) {
+  params.timestamp = Date.now();
+  params.signature = bingxSign(params);
+  const qs = new URLSearchParams(params).toString();
+  return httpRequest({
+    hostname: BINGX_BASE,
+    path:     `${path_}?${qs}`,
+    method:   "GET",
+    headers:  { "X-BX-APIKEY": CONFIG.BINGX_API_KEY },
+  });
+}
+
+async function bingxPost(path_, params = {}) {
+  params.timestamp = Date.now();
+  params.signature = bingxSign(params);
+  const qs = new URLSearchParams(params).toString();
+  return httpRequest({
+    hostname: BINGX_BASE,
+    path:     `${path_}?${qs}`,
+    method:   "POST",
+    headers:  { "X-BX-APIKEY": CONFIG.BINGX_API_KEY, "Content-Length": 0 },
+  });
+}
+
+async function getKlines(symbol, interval, limit) {
+  const r = await bingxGet("/openApi/swap/v3/quote/klines", { symbol, interval, limit });
+  return r.data || [];
+}
+
+async function getTicker(symbol) {
+  const r = await bingxGet("/openApi/swap/v2/quote/ticker", { symbol });
+  return r.data || {};
+}
+
+async function setLeverage(symbol, leverage, side) {
+  return bingxPost("/openApi/swap/v2/trade/leverage", { symbol, side, leverage });
+}
+
+async function placeOrder(symbol, side, quantity, tpPrice, slPrice) {
+  const params = {
+    symbol,
+    side,
+    positionSide: side === "BUY" ? "LONG" : "SHORT",
+    type:         "MARKET",
+    quantity:     quantity.toFixed(4),
+  };
+  if (tpPrice) params.takeProfit = JSON.stringify({
+    type: "TAKE_PROFIT_MARKET", stopPrice: tpPrice.toFixed(6), workingType: "MARK_PRICE",
+  });
+  if (slPrice) params.stopLoss = JSON.stringify({
+    type: "STOP_MARKET", stopPrice: slPrice.toFixed(6), workingType: "MARK_PRICE",
+  });
+  return bingxPost("/openApi/swap/v2/trade/order", params);
+}
+
+async function getPositions(symbol) {
+  const r = await bingxGet("/openApi/swap/v2/user/positions", { symbol });
+  return r.data || [];
+}
+
+async function getFundingRate(symbol) {
+  try {
+    const r = await bingxGet("/openApi/swap/v2/quote/premiumIndex", { symbol });
+    return parseFloat(r.data.lastFundingRate) || 0;
+  } catch { return 0; }
+}
+
+// ════════════════════════════════════════════
+//  技術分析
+// ════════════════════════════════════════════
+function parseKlines(raw) {
+  return raw.map(k => ({
+    openTime: parseInt(k[0]),
+    open:  parseFloat(k[1]),
+    high:  parseFloat(k[2]),
+    low:   parseFloat(k[3]),
+    close: parseFloat(k[4]),
+    vol:   parseFloat(k[5]),
+  })).sort((a,b) => a.openTime - b.openTime);
+}
+
+function findRange(candles, lookback) {
+  const recent = candles.slice(-lookback);
+  const sup = Math.min(...recent.map(c=>c.low));
+  const res = Math.max(...recent.map(c=>c.high));
+  return { sup, res };
+}
+
+function isConsolidating(candles, lookback, threshold = 0.08) {
+  const { sup, res } = findRange(candles, lookback);
+  if (sup === 0) return false;
+  return (res - sup) / sup < threshold;
+}
+
+function detectReversalCandle(candles) {
+  if (candles.length < 2) return null;
+  const last = candles[candles.length - 1];
+  const prev = candles[candles.length - 2];
+  const body       = Math.abs(last.close - last.open);
+  const total      = last.high - last.low;
+  if (total === 0) return null;
+  const lowerWick  = Math.min(last.open, last.close) - last.low;
+  const upperWick  = last.high - Math.max(last.open, last.close);
+
+  if (lowerWick > 2*body && lowerWick > upperWick) return "BULLISH";
+  if (upperWick > 2*body && upperWick > lowerWick) return "BEARISH";
+  if (last.close > last.open && prev.close < prev.open &&
+      last.close > prev.open && last.open < prev.close) return "BULLISH";
+  if (last.close < last.open && prev.close > prev.open &&
+      last.close < prev.open && last.open > prev.close) return "BEARISH";
+  return null;
+}
+
+function detectFakeout(candles1m, sup, res, lookbackCandles) {
+  if (candles1m.length < lookbackCandles + 1) return null;
+  const recent    = candles1m.slice(-lookbackCandles - 1);
+  const last      = candles1m[candles1m.length - 1];
+  const brokeUp   = Math.max(...recent.map(c=>c.high)) > res;
+  const brokeDown = Math.min(...recent.map(c=>c.low))  < sup;
+  const inRange   = last.close >= sup && last.close <= res;
+  if (brokeUp   && inRange) return "BEARISH";
+  if (brokeDown && inRange) return "BULLISH";
+  return null;
+}
+
+function volumeOk(candles, ratio) {
+  if (candles.length < 20) return true;
+  const recent20avg = candles.slice(-20).reduce((s,c)=>s+c.vol,0) / 20;
+  return candles[candles.length-1].vol >= recent20avg * ratio;
+}
+
+// ════════════════════════════════════════════
+//  學習模組
+// ════════════════════════════════════════════
+const TRADE_FILE  = path.join(DATA_DIR, "trades.json");
+const PARAMS_FILE = path.join(DATA_DIR, "params.json");
+
+function loadTrades() {
+  try { return JSON.parse(fs.readFileSync(TRADE_FILE, "utf8")); } catch { return []; }
+}
+function saveTrades(trades) {
+  fs.writeFileSync(TRADE_FILE, JSON.stringify(trades, null, 2));
+}
+function loadParams() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(PARAMS_FILE, "utf8"));
+    Object.assign(PARAMS, saved);
+    info(`載入學習後參數: ${JSON.stringify(PARAMS)}`);
+  } catch {}
+}
+function saveParams(p) {
+  fs.writeFileSync(PARAMS_FILE, JSON.stringify(p, null, 2));
+}
+
+function recordTrade(trade) {
+  const trades = loadTrades();
+  trades.push({ time: new Date().toISOString(), ...trade });
+  saveTrades(trades);
+}
+
+function todayTrades() {
+  const today = new Date().toISOString().slice(0, 10);
+  return loadTrades().filter(t => t.time.startsWith(today));
+}
+
+async function analyzeAndLearn(oldParams) {
+  const trades = loadTrades();
+  if (trades.length < 10) return oldParams;
+  const recent   = trades.slice(-30);
+  const wins     = recent.filter(t=>t.result==="WIN").length;
+  const winRate  = wins / recent.length;
+  const avgPnl   = recent.reduce((s,t)=>s+t.pnl_pct,0) / recent.length;
+  const newParams = { ...oldParams };
+
+  if (winRate < 0.40)
+    newParams.edge_threshold = Math.max(0.004, oldParams.edge_threshold * 0.85);
+  if (winRate > 0.60 && avgPnl > 0)
+    newParams.tp_pct = Math.min(0.04, oldParams.tp_pct * 1.1);
+
+  saveParams(newParams);
+  await TG.learning(winRate, avgPnl, oldParams, newParams);
+  info(`學習完成 勝率=${(winRate*100).toFixed(0)}% avgPnl=${(avgPnl*100).toFixed(2)}%`);
+  return newParams;
+}
+
+// ════════════════════════════════════════════
+//  主狀態
+// ════════════════════════════════════════════
+const state = {
+  inPosition:   false,
+  currentTrade: null,
+  dailyTrades:  0,
+  dailyLosses:  0,
+  lastResetDay: new Date().getUTCDate(),
+};
+
+function canTrade() {
+  if (state.inPosition)                              return [false, "持倉中"];
+  if (state.dailyTrades >= CONFIG.MAX_DAILY_TRADES)  return [false, `已達每日上限 ${CONFIG.MAX_DAILY_TRADES} 筆`];
+  if (state.dailyLosses >= CONFIG.MAX_DAILY_LOSSES)  return [false, `連虧 ${state.dailyLosses} 次，停手`];
+  const now = new Date();
+  const h = now.getUTCHours(), m = now.getUTCMinutes();
+  for (const sh of [0, 8, 16]) {
+    if (h === sh && m < 15)                return [false, `資金費率結算時段 ${sh}:00 UTC`];
+    if (h === (sh - 1 + 24) % 24 && m >= 45) return [false, "資金費率結算前 15 分鐘"];
+  }
+  return [true, ""];
+}
+
+// ════════════════════════════════════════════
+//  進場
+// ════════════════════════════════════════════
+async function enter(direction, price, sup, res, strategy, funding) {
+  const isLong  = direction === "BULLISH";
+  const side    = isLong ? "BUY" : "SELL";
+  const slPrice = isLong ? price * (1 - PARAMS.sl_pct) : price * (1 + PARAMS.sl_pct);
+  const tpPrice = isLong ? price * (1 + PARAMS.tp_pct) : price * (1 - PARAMS.tp_pct);
+  const qty     = parseFloat(((CONFIG.POSITION_USDT * CONFIG.LEVERAGE) / price).toFixed(4));
+
+  info(`進場 策略=${strategy} ${side} price=${price.toFixed(5)} sl=${slPrice.toFixed(5)} tp=${tpPrice.toFixed(5)} qty=${qty}`);
+
+  try {
+    await setLeverage(CONFIG.SYMBOL, CONFIG.LEVERAGE, isLong ? "LONG" : "SHORT");
+    const result = await placeOrder(CONFIG.SYMBOL, side, qty, tpPrice, slPrice);
+    info(`下單結果: ${JSON.stringify(result)}`);
+
+    await TG.entry(strategy, side, price, tpPrice, slPrice, qty);
+
+    state.inPosition  = true;
+    state.dailyTrades++;
+    state.currentTrade = { strategy, side, entry: price, tp: tpPrice, sl: slPrice, funding, time: Date.now() };
+  } catch(e) {
+    error(`下單失敗: ${e.message}`);
+    await TG.error(`下單失敗: ${e.message}`);
+  }
+}
+
+// ════════════════════════════════════════════
+//  監控倉位
+// ════════════════════════════════════════════
+async function checkPosition() {
+  if (!state.inPosition) return;
+  try {
+    const positions = await getPositions(CONFIG.SYMBOL);
+    const active    = positions.filter(p => parseFloat(p.positionAmt || 0) !== 0);
+    if (active.length > 0) return;  // 還在倉
+
+    const ticker  = await getTicker(CONFIG.SYMBOL);
+    const price   = parseFloat(ticker.lastPrice || state.currentTrade.entry);
+    const { entry, side, strategy, funding } = state.currentTrade;
+    const isLong  = side === "BUY";
+    const pnlPct  = (price - entry) / entry * (isLong ? 1 : -1);
+    const result  = pnlPct > 0.001 ? "WIN" : pnlPct < -0.001 ? "LOSS" : "BREAKEVEN";
+
+    if (result === "LOSS") state.dailyLosses++;
+    else                   state.dailyLosses = 0;
+
+    recordTrade({ strategy, side, entry, tp: state.currentTrade.tp, sl: state.currentTrade.sl,
+                  result, pnl_pct: pnlPct, funding_rate: funding });
+
+    await TG.close(result, pnlPct, state.dailyTrades, state.dailyLosses);
+    info(`出場 ${result} pnl=${(pnlPct*100).toFixed(2)}%`);
+
+    // 每 20 筆學習一次
+    const totalTrades = loadTrades().length;
+    if (totalTrades % 20 === 0) {
+      PARAMS = await analyzeAndLearn(PARAMS);
+    }
+
+    if (state.dailyLosses >= CONFIG.MAX_DAILY_LOSSES) {
+      await TG.pause(`連虧 ${state.dailyLosses} 次達上限，今日停手`);
+    }
+
+    state.inPosition   = false;
+    state.currentTrade = null;
+  } catch(e) {
+    error(`checkPosition 錯誤: ${e.message}`);
+    await TG.error(e.message);
+  }
+}
+
+// ════════════════════════════════════════════
+//  掃描一次
+// ════════════════════════════════════════════
+async function runOnce() {
+  try {
+    const [raw15m, raw1m, ticker] = await Promise.all([
+      getKlines(CONFIG.SYMBOL, "15m", 60),
+      getKlines(CONFIG.SYMBOL, "1m",  20),
+      getTicker(CONFIG.SYMBOL),
+    ]);
+
+    if (!raw15m.length || !raw1m.length || !ticker.lastPrice) return;
+
+    const c15m  = parseKlines(raw15m);
+    const c1m   = parseKlines(raw1m);
+    const price = parseFloat(ticker.lastPrice);
+
+    if (!isConsolidating(c15m, PARAMS.range_lookback)) {
+      info(`非盤整 price=${price.toFixed(5)}`);
+      return;
+    }
+
+    const { sup, res } = findRange(c15m, PARAMS.range_lookback);
+    info(`盤整確認 price=${price.toFixed(5)} S=${sup.toFixed(5)} R=${res.toFixed(5)}`);
+
+    if (!volumeOk(c1m, PARAMS.min_volume_ratio)) {
+      info("量能不足，略過");
+      return;
+    }
+
+    const funding    = await getFundingRate(CONFIG.SYMBOL);
+    const [ok, reason] = canTrade();
+    if (!ok) { info(`風控: ${reason}`); return; }
+
+    // 策略 B 優先：假突破
+    const fakeout = detectFakeout(c1m, sup, res, PARAMS.fakeout_candles);
+    if (fakeout) {
+      info(`策略B 假突破: ${fakeout}`);
+      await TG.signal("B", fakeout, price, sup, res, funding);
+      await enter(fakeout, price, sup, res, "B", funding);
+      return;
+    }
+
+    // 策略 A：邊緣反彈
+    const nearSup = (price - sup) / sup   < PARAMS.edge_threshold;
+    const nearRes = (res - price) / price < PARAMS.edge_threshold;
+
+    if (nearSup) {
+      const sig = detectReversalCandle(c1m);
+      if (sig === "BULLISH" && funding <= 0.0005) {
+        await TG.signal("A", sig, price, sup, res, funding);
+        await enter(sig, price, sup, res, "A", funding);
+      }
+    } else if (nearRes) {
+      const sig = detectReversalCandle(c1m);
+      if (sig === "BEARISH" && funding >= -0.0003) {
+        await TG.signal("A", sig, price, sup, res, funding);
+        await enter(sig, price, sup, res, "A", funding);
+      }
+    }
+  } catch(e) {
+    error(`runOnce 錯誤: ${e.message}`);
+    await TG.error(e.message);
+  }
+}
+
+// ════════════════════════════════════════════
+//  每日摘要（UTC 23:55）
+// ════════════════════════════════════════════
+function scheduleDailySummary() {
+  setInterval(async () => {
+    const now = new Date();
+    if (now.getUTCHours() === 23 && now.getUTCMinutes() === 55) {
+      await TG.dailySummary(todayTrades());
+    }
+  }, 60_000);
+}
+
+// ════════════════════════════════════════════
+//  主迴圈
+// ════════════════════════════════════════════
+async function main() {
+  loadParams();
+  await TG.start(PARAMS);
+  info("機器人啟動");
+  scheduleDailySummary();
+
+  // 每日重置
+  setInterval(() => {
+    const today = new Date().getUTCDate();
+    if (today !== state.lastResetDay) {
+      state.dailyTrades  = 0;
+      state.dailyLosses  = 0;
+      state.lastResetDay = today;
+      info("每日計數器重置");
+      TG.resume();
+    }
+  }, 60_000);
+
+  // 主掃描迴圈
+  const loop = async () => {
+    await checkPosition();
+    if (!state.inPosition) await runOnce();
+    setTimeout(loop, CONFIG.LOOP_INTERVAL_MS);
+  };
+
+  loop();
+
+  process.on("SIGINT", async () => {
+    await tgSend("🛑 <b>機器人已手動停止</b>");
+    info("使用者中斷");
+    process.exit(0);
+  });
+}
+
+main().catch(async e => {
+  error(`啟動失敗: ${e.message}`);
+  await TG.error(`啟動失敗: ${e.message}`);
+  process.exit(1);
+});
