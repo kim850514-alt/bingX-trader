@@ -11,9 +11,13 @@ let cfg={
   symbols:['BTCUSDT','ETHUSDT','SOLUSDT'],
   tradeAmount:5,leverage:5,maxRiskPercent:10,
   stopLossPercent:0.5,takeProfitPercent:1.0,
-  allowShort:true,botRunning:false,maxPositions:3,
-  // ✅ 開單門檻從 4 降到 2，更容易進場
+  allowShort:true,botRunning:false,
+  // ✅ 移除持倉數量限制
+  maxPositions:999,
   entryThreshold:2,
+  maxHoldMin:30,
+  // ✅ 每3筆交易學習一次，學習完才繼續
+  learnBatchSize:3,
   params:{rsiPeriod:7,oversold:35,overbought:65,volMultiple:1.3,bbPeriod:15,bbStdDev:2}
 };
 let stats=loadStats();
@@ -28,9 +32,31 @@ function recordTrade(t){
   stats.allTime.total++;if(t.pnl>0)stats.allTime.wins++;else stats.allTime.losses++;stats.allTime.pnl+=t.pnl;
   stats.trades.push(Object.assign({},t,{date:todayKey()}));
   if(stats.trades.length>500)stats.trades=stats.trades.slice(-500);
-  saveStats();learnFromTrade(t);
+  saveStats();
+
+  // ✅ 學習週期：每 learnBatchSize 筆觸發一次學習
+  learnCycleCount++;
+  learnFromTrade(t);
+
+  if(learnCycleCount>=cfg.learnBatchSize){
+    learnCycleCount=0;
+    learningPause=true;
+    log('AI','=== 學習週期觸發！暫停交易，開始分析 ===');
+    tg('[Bybit 🧠] 學習週期開始\n已完成 '+cfg.learnBatchSize+' 筆交易\n暫停開新倉，分析中...');
+    // 執行學習
+    autoAdjust();
+    // 學習完成，恢復交易
+    setTimeout(function(){
+      learningPause=false;
+      log('AI','=== 學習完成！恢復交易 ===');
+      tg('[Bybit 🧠] 學習完成！恢復交易\n下一批：'+cfg.learnBatchSize+'筆');
+    },3000);
+  }
 }
 let brain=loadBrain();
+// ✅ 學習週期控制
+var learnCycleCount=0;  // 目前這批已完成交易數
+var learningPause=false; // 是否暫停等待學習完成
 function loadBrain(){if(fs.existsSync('./bybit_brain.json'))try{return JSON.parse(fs.readFileSync('./bybit_brain.json','utf8'));}catch(e){}return{symbolPerf:{},hourPerf:{},errorPatterns:[],adjustHistory:[],learnCount:0,bestHours:[],worstHours:[],bestSymbols:[],worstSymbols:[],entryThresholdHistory:[]};}
 function saveBrain(){fs.writeFileSync('./bybit_brain.json',JSON.stringify(brain,null,2));}
 
@@ -47,7 +73,7 @@ function learnFromTrade(t){
   var hp=brain.hourPerf[hr];if(pnl>0)hp.wins++;else hp.losses++;hp.pnl+=pnl;
   if(pnl<0){brain.errorPatterns.push({symbol:symbol,pnl:pnl,holdMin:holdMin,hour:hourTW(),date:todayKey()});if(brain.errorPatterns.length>100)brain.errorPatterns=brain.errorPatterns.slice(-100);}
   // ✅ 每 5 筆就學習一次（原本 10 筆）
-  if(brain.learnCount%5===0)autoAdjust();
+  if(brain.learnCount%5===0){} // autoAdjust 已移到 recordTrade 的學習週期
   updateBestWorst();saveBrain();
   log('AI',pnl>0?symbol+' 獲利 +'+pnl.toFixed(2)+'U (hold:'+holdMin+'min)':symbol+' 虧損 '+pnl.toFixed(2)+'U (hold:'+holdMin+'min)');
 }
@@ -73,24 +99,40 @@ function autoAdjust(){
   if(wr<0.35&&cfg.entryThreshold<4){cfg.entryThreshold++;changes.push('門檻提高 ->'+cfg.entryThreshold);}
   if(wr>0.65&&cfg.entryThreshold>1){cfg.entryThreshold--;changes.push('門檻降低 ->'+cfg.entryThreshold);}
 
+  // ── 超時平倉時間自動調整 ──
+  var timeoutTrades=recent.filter(function(t){return t.reason==='超時平倉';});
+  if(timeoutTrades.length>=3){
+    var timeoutWins=timeoutTrades.filter(function(t){return t.pnl>0;});
+    var timeoutWr=timeoutWins.length/timeoutTrades.length;
+    var avgTimeoutHold=timeoutTrades.reduce(function(s,t){return s+(t.holdMin||0);},0)/timeoutTrades.length;
+    // 超時單大多虧損 → 縮短超時（更快停損）
+    if(timeoutWr<0.3&&cfg.maxHoldMin>10){
+      var ot=cfg.maxHoldMin;cfg.maxHoldMin=Math.max(10,ot-5);
+      changes.push('超時 縮短 '+ot+'->'+cfg.maxHoldMin+'min');
+    }
+    // 超時單大多獲利 → 延長超時（讓獲利單跑更久）
+    if(timeoutWr>0.6&&cfg.maxHoldMin<120){
+      var ot2=cfg.maxHoldMin;cfg.maxHoldMin=Math.min(120,ot2+5);
+      changes.push('超時 延長 '+ot2+'->'+cfg.maxHoldMin+'min');
+    }
+    // 平均持倉時間遠小於超時時間 → 縮短超時
+    if(avgTimeoutHold<cfg.maxHoldMin*0.5&&cfg.maxHoldMin>15){
+      var ot3=cfg.maxHoldMin;cfg.maxHoldMin=Math.max(15,Math.round(avgTimeoutHold*1.5));
+      changes.push('超時 優化 '+ot3+'->'+cfg.maxHoldMin+'min');
+    }
+  }
+
   // ── RSI 自動調整 ──
-  // 勝率低：收緊 RSI（更嚴格的超買超賣）
   if(wr<0.38&&cfg.params.oversold>20){var rv=cfg.params.oversold;cfg.params.oversold=Math.max(20,rv-2);changes.push('RSI超賣 收緊 '+rv+'->'+cfg.params.oversold);}
   if(wr<0.38&&cfg.params.overbought<80){var rv2=cfg.params.overbought;cfg.params.overbought=Math.min(80,rv2+2);changes.push('RSI超買 收緊 '+rv2+'->'+cfg.params.overbought);}
-  // 勝率高：放寬 RSI（更多進場機會）
   if(wr>0.62&&cfg.params.oversold<45){var rv3=cfg.params.oversold;cfg.params.oversold=Math.min(45,rv3+2);changes.push('RSI超賣 放寬 '+rv3+'->'+cfg.params.oversold);}
   if(wr>0.62&&cfg.params.overbought>55){var rv4=cfg.params.overbought;cfg.params.overbought=Math.max(55,rv4-2);changes.push('RSI超買 放寬 '+rv4+'->'+cfg.params.overbought);}
-  // RSI 週期：持倉時間短且虧損，縮短週期（更靈敏）
   if(wr<0.4&&avgHold<5&&cfg.params.rsiPeriod>5){var rp=cfg.params.rsiPeriod;cfg.params.rsiPeriod=Math.max(5,rp-1);changes.push('RSI週期 縮短 '+rp+'->'+cfg.params.rsiPeriod);}
-  // 持倉時間長且虧損，延長週期（更穩定）
   if(wr<0.4&&avgHold>15&&cfg.params.rsiPeriod<14){var rp2=cfg.params.rsiPeriod;cfg.params.rsiPeriod=Math.min(14,rp2+1);changes.push('RSI週期 延長 '+rp2+'->'+cfg.params.rsiPeriod);}
 
   // ── 布林帶自動調整 ──
-  // 勝率低：加寬布林帶（減少假突破）
   if(wr<0.38&&cfg.params.bbStdDev<2.5){var bv=cfg.params.bbStdDev;cfg.params.bbStdDev=+(Math.min(2.5,bv+0.1)).toFixed(1);changes.push('BB寬度 加寬 '+bv+'->'+cfg.params.bbStdDev);}
-  // 勝率高：收窄布林帶（更多進場機會）
   if(wr>0.62&&cfg.params.bbStdDev>1.5){var bv2=cfg.params.bbStdDev;cfg.params.bbStdDev=+(Math.max(1.5,bv2-0.1)).toFixed(1);changes.push('BB寬度 收窄 '+bv2+'->'+cfg.params.bbStdDev);}
-  // 布林帶週期：市場變化快時縮短
   if(wr<0.4&&avgHold<8&&cfg.params.bbPeriod>10){var bp=cfg.params.bbPeriod;cfg.params.bbPeriod=Math.max(10,bp-1);changes.push('BB週期 縮短 '+bp+'->'+cfg.params.bbPeriod);}
   if(wr>0.6&&cfg.params.bbPeriod<20){var bp2=cfg.params.bbPeriod;cfg.params.bbPeriod=Math.min(20,bp2+1);changes.push('BB週期 延長 '+bp2+'->'+cfg.params.bbPeriod);}
 
@@ -100,7 +142,7 @@ function autoAdjust(){
 
   if(changes.length){
     brain.adjustHistory.push({date:todayKey(),changes:changes,wr:(wr*100).toFixed(1),rr:rr.toFixed(2),
-      params:{rsi:cfg.params.oversold+'/'+cfg.params.overbought,rsiP:cfg.params.rsiPeriod,bb:cfg.params.bbPeriod+'/'+cfg.params.bbStdDev,vol:cfg.params.volMultiple,thr:cfg.entryThreshold}});
+      params:{rsi:cfg.params.oversold+'/'+cfg.params.overbought,rsiP:cfg.params.rsiPeriod,bb:cfg.params.bbPeriod+'/'+cfg.params.bbStdDev,vol:cfg.params.volMultiple,thr:cfg.entryThreshold,timeout:cfg.maxHoldMin}});
     if(brain.adjustHistory.length>100)brain.adjustHistory=brain.adjustHistory.slice(-100);
     log('AI','自動調整: '+changes.join(' | '));
     tg('[Bybit 🧠 自動調整]\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'% RR:'+rr.toFixed(2)+'\n持倉均時:'+avgHold.toFixed(0)+'min');
@@ -157,14 +199,80 @@ async function getBalance(){
   throw new Error('Cannot get Bybit balance');
 }
 
+// ✅ 從 Bybit API 抓實際成交盈虧（包含手續費和資金費率）
+async function getActualPnl(symbol,openTime){
+  try{
+    // 方法1：從 closed-pnl 抓（最準確，包含所有費用）
+    var r=await bybitReq('GET','/v5/position/closed-pnl',{
+      category:'linear',symbol:symbol,limit:20
+    });
+    if(r.retCode===0&&r.result.list&&r.result.list.length>0){
+      // 找開倉後的第一筆平倉記錄
+      var trades=r.result.list.filter(function(t){
+        return parseInt(t.updatedTime||t.createdTime)>openTime;
+      });
+      if(trades.length>0){
+        var latest=trades[0];
+        var actualPnl=parseFloat(latest.closedPnl||0);
+        var exitPrice=parseFloat(latest.avgExitPrice||0);
+        log('INFO','API實際PnL: '+actualPnl.toFixed(4)+'U 出場價:'+exitPrice+' (含手續費+資金費率)');
+        return{
+          pnl:actualPnl,
+          exitPrice:exitPrice,
+          source:'api'
+        };
+      }
+    }
+  }catch(e){log('WARN','getActualPnl失敗: '+e.message);}
+
+  // 方法2：從交易歷史抓
+  try{
+    var r2=await bybitReq('GET','/v5/execution/list',{
+      category:'linear',symbol:symbol,limit:10
+    });
+    if(r2.retCode===0&&r2.result.list&&r2.result.list.length>0){
+      var execs=r2.result.list.filter(function(t){
+        return parseInt(t.execTime)>openTime&&(t.execType==='Trade');
+      });
+      if(execs.length>0){
+        var totalPnl=execs.reduce(function(s,e){return s+parseFloat(e.closedSize?e.realizedPnl||0:0);},0);
+        var exitP=parseFloat(execs[0].execPrice||0);
+        log('INFO','執行歷史PnL: '+totalPnl.toFixed(4)+'U');
+        return{pnl:totalPnl,exitPrice:exitP,source:'execution'};
+      }
+    }
+  }catch(e){log('WARN','getExecution失敗: '+e.message);}
+
+  return null;
+}
+
+// 資金費率估算（備用）
+function estimateFundingCost(positionValue,openTimeMs){
+  var holdHours=(Date.now()-openTimeMs)/3600000;
+  var fundingTimes=Math.floor(holdHours/8);
+  return positionValue*0.0001*fundingTimes;
+}
+
 async function getPositions(symbol){try{var p={category:'linear',settleCoin:'USDT'};if(symbol)p.symbol=symbol;var r=await bybitReq('GET','/v5/position/list',p);if(r.retCode===0)return(r.result.list||[]).filter(function(p){return parseFloat(p.size||0)!==0;});}catch(e){}return[];}
-async function getKlines(symbol,interval,limit){limit=limit||100;try{var r=await bybitReq('GET','/v5/market/kline',{category:'linear',symbol:symbol,interval:interval,limit:limit});if(r.retCode===0)return r.result.list||[];}catch(e){}return[];}
+async function getKlines(symbol,interval,limit){
+  limit=limit||100;
+  // ✅ 修復時間框：3m->3, 5m->5, 1m->1, 1h->60, 4h->240
+  var iv=interval;
+  if(interval==='1m')iv='1';
+  else if(interval==='3m')iv='3';
+  else if(interval==='5m')iv='5';
+  else if(interval==='15m')iv='15';
+  else if(interval==='1h')iv='60';
+  else if(interval==='4h')iv='240';
+  try{var r=await bybitReq('GET','/v5/market/kline',{category:'linear',symbol:symbol,interval:iv,limit:limit});if(r.retCode===0)return r.result.list||[];}catch(e){log('ERROR','getKlines '+symbol+': '+e.message);}return[];
+}
 async function getTicker(symbol){try{var r=await bybitReq('GET','/v5/market/tickers',{category:'linear',symbol:symbol});if(r.retCode===0)return r.result.list[0];}catch(e){}return null;}
 async function setLeverage(symbol,leverage){try{await bybitReq('POST','/v5/position/set-leverage',{category:'linear',symbol:symbol,buyLeverage:String(leverage),sellLeverage:String(leverage)});}catch(e){}}
 
 async function placeOrder(o){
   await setLeverage(o.symbol,cfg.leverage);
-  var p={category:'linear',symbol:o.symbol,side:o.side,orderType:'Market',qty:String(o.quantity),positionIdx:o.side==='Buy'?1:2};
+  // ✅ 改用單向持倉模式（positionIdx:0），不需要改帳戶設定
+  var p={category:'linear',symbol:o.symbol,side:o.side,orderType:'Market',qty:String(o.quantity),positionIdx:0};
   if(o.stopLoss)p.stopLoss=String(o.stopLoss);
   if(o.takeProfit)p.takeProfit=String(o.takeProfit);
   log('INFO','下單 '+o.side+' '+o.symbol+' x'+o.quantity);
@@ -173,7 +281,21 @@ async function placeOrder(o){
   else{log('ERROR','失敗 ['+r.retCode+'] '+r.retMsg);tg('[Bybit] ❌ 開單失敗\n'+o.symbol+'\n原因:'+r.retMsg);return null;}
 }
 
-async function closePos(sym,side,qty){return placeOrder({symbol:sym,side:side==='Buy'?'Sell':'Buy',quantity:qty,positionIdx:side==='Buy'?1:2});}
+async function closePos(sym,side,qty){return placeOrder({symbol:sym,side:side==='Buy'?'Sell':'Buy',quantity:qty});}
+
+// ✅ 取得幣種最小數量步進
+function getQtyStep(price){
+  if(price>=10000)return 0.001;   // BTC
+  if(price>=1000)return 0.01;    // ETH
+  if(price>=100)return 0.1;      // SOL
+  if(price>=1)return 1;          // DOGE, XRP
+  if(price>=0.001)return 10;     // SHIB
+  return 100;                     // PEPE
+}
+
+function roundQty(qty,step){
+  return Math.floor(qty/step)*step;
+}
 
 var I={
   ma:function(a,n){if(a.length<n)return null;return a.slice(-n).reduce(function(s,v){return s+v;},0)/n;},
@@ -275,6 +397,11 @@ var openTrades={},botTimer=null,startTime=Date.now();
 
 async function tradingLoop(){
   if(!cfg.botRunning)return;
+  // ✅ 學習暫停期間不開新倉
+  if(learningPause){
+    log('INFO','學習暫停中，跳過開倉');
+    return;
+  }
   log('INFO','=== Loop '+nowTW()+' ===');
   try{
     var posCount=Object.keys(openTrades).length;
@@ -295,18 +422,25 @@ async function tradingLoop(){
         var bal=await getBalance();
         var amt=Math.min(cfg.tradeAmount,bal.available*(cfg.maxRiskPercent/100));
         if(amt<1){log('WARN',sym+' 餘額不足 '+bal.available.toFixed(2)+'U');continue;}
-        var qty=parseFloat((amt*cfg.leverage/cur).toFixed(4));
-        if(qty<=0)continue;
-        var slD=Math.max(atrV*1.2,cur*cfg.stopLossPercent/100);
-        var tpD=Math.max(atrV*2.0,cur*cfg.takeProfitPercent/100);
-        var slP=signal==='BUY'?+(cur-slD).toFixed(4):+(cur+slD).toFixed(4);
-        var tpP=signal==='BUY'?+(cur+tpD).toFixed(4):+(cur-tpD).toFixed(4);
+        // ✅ 修復數量：根據價格取得步進，向下取整
+        var step=getQtyStep(cur);
+        var rawQty=amt*cfg.leverage/cur;
+        var qty=roundQty(rawQty,step);
+        if(qty<=0){log('WARN',sym+' 數量為0，跳過');continue;}
+        log('INFO',sym+' 數量計算: '+rawQty.toFixed(4)+' -> '+qty+' (步進:'+step+')');
+        var atrVal=atrV||cur*0.005;
+        var slD=Math.max(atrVal*1.2,cur*cfg.stopLossPercent/100);
+        var tpD=Math.max(atrVal*2.0,cur*cfg.takeProfitPercent/100);
+        var slP=+(signal==='BUY'?cur-slD:cur+slD).toFixed(4);
+        var tpP=+(signal==='BUY'?cur+tpD:cur-tpD).toFixed(4);
+        log('INFO',sym+' SL:'+slP+' TP:'+tpP);
         var pos=await getPositions(sym);
-        if(signal==='BUY'&&!pos.some(function(p){return p.side==='Buy';})&&!openTrades[sym+'_L']){
+        var hasAnyPos=pos.length>0||openTrades[sym+'_L']||openTrades[sym+'_S'];
+        if(signal==='BUY'&&!hasAnyPos){
           var o=await placeOrder({symbol:sym,side:'Buy',quantity:qty,stopLoss:slP,takeProfit:tpP});
           if(o)openTrades[sym+'_L']={symbol:sym,side:'Buy',entry:cur,qty:qty,reason:reasons,openTime:Date.now()};
         }
-        if(signal==='SELL'&&cfg.allowShort&&!pos.some(function(p){return p.side==='Sell';})&&!openTrades[sym+'_S']){
+        if(signal==='SELL'&&cfg.allowShort&&!hasAnyPos){
           var o2=await placeOrder({symbol:sym,side:'Sell',quantity:qty,stopLoss:slP,takeProfit:tpP});
           if(o2)openTrades[sym+'_S']={symbol:sym,side:'Sell',entry:cur,qty:qty,reason:reasons,openTime:Date.now()};
         }
@@ -324,14 +458,44 @@ async function checkPositions(){
       if(!tk)continue;
       var cur=parseFloat(tk.lastPrice);
       var holdMin=Math.round((Date.now()-t.openTime)/60000);
-      var pnl=t.side==='Buy'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;
-      log('INFO','持倉 '+t.symbol+' PnL:'+(pnl>=0?'+':'')+pnl.toFixed(2)+'U Hold:'+holdMin+'min');
-      if(holdMin>=30){
+
+      // ✅ 先檢查 Bybit 上是否已經平倉（被 TP/SL 觸發）
+      var pos=await getPositions(t.symbol);
+      var stillOpen=pos.some(function(p){return parseFloat(p.size||0)!==0;});
+
+      if(!stillOpen&&holdMin>1){
+        // 已被交易所平倉，抓實際 PnL
+        var actual=await getActualPnl(t.symbol,t.openTime);
+        var pnl=actual?actual.pnl:(t.side==='Buy'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage);
+        var exitPrice=actual?actual.exitPrice:cur;
+        var fee=actual?actual.fee:(t.entry+cur)*t.qty*0.00055;
+        var pnlNet=actual?pnl:pnl-fee;
+        recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:exitPrice,qty:t.qty,pnl:pnlNet,holdMin:holdMin,reason:'TP/SL觸發'});
+        delete openTrades[key];
+        tg('[Bybit] '+(pnlNet>=0?'✅ 獲利':'❌ 虧損')+'\n'+t.symbol+'\n進場:'+t.entry.toFixed(4)+' 出場:'+exitPrice.toFixed(4)+'\n實際PnL:'+(pnlNet>=0?'+':'')+pnlNet.toFixed(2)+'U\nHold:'+holdMin+'min\n原因:TP/SL觸發');
+        log('INFO',t.symbol+' TP/SL觸發 實際PnL:'+pnlNet.toFixed(2)+'U');
+        continue;
+      }
+
+      // 估算當前盈虧（含資金費率）
+      var estPnl=t.side==='Buy'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;
+      var estFee=(t.entry+cur)*t.qty*0.00055;
+      var posVal=cur*t.qty;
+      var fundingCost=estimateFundingCost(posVal,t.openTime);
+      var estNet=estPnl-estFee-fundingCost;
+      log('INFO','持倉 '+t.symbol+' 估算PnL:'+(estPnl>=0?'+':'')+estPnl.toFixed(2)+'U 手續費:-'+estFee.toFixed(3)+'U 資金費率:-'+fundingCost.toFixed(3)+'U 淨:'+(estNet>=0?'+':'')+estNet.toFixed(2)+'U Hold:'+holdMin+'min');
+
+      if(holdMin>=cfg.maxHoldMin){
         var o=await closePos(t.symbol,t.side,t.qty).catch(function(){return null;});
         if(o){
-          recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl,holdMin:holdMin,reason:'超時平倉'});
+          // 等一秒讓交易所結算
+          await new Promise(function(res){setTimeout(res,1000);});
+          var actual2=await getActualPnl(t.symbol,t.openTime);
+          var pnl2=actual2?actual2.pnl:estPnl-estFee;
+          var exit2=actual2?actual2.exitPrice:cur;
+          recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:exit2,qty:t.qty,pnl:pnl2,holdMin:holdMin,reason:'超時平倉'});
           delete openTrades[key];
-          tg('[Bybit] ⏰ 超時平倉\n'+t.symbol+'\nPnL:'+(pnl>=0?'✅ +':'❌ ')+pnl.toFixed(2)+'U\nHold:'+holdMin+'min');
+          tg('[Bybit] ⏰ 超時平倉\n'+t.symbol+'\n實際PnL:'+(pnl2>=0?'✅ +':'❌ ')+pnl2.toFixed(2)+'U\nHold:'+holdMin+'min');
         }
       }
     }catch(e){log('ERROR','checkPositions '+e.message);}
@@ -383,10 +547,10 @@ function handleUpdate(update){
   if(cmd==='/go'){
     if(cfg.botRunning){tg('⚠️ 已在運行中',chatId);return;}
     cfg.botRunning=true;
-    var ms={'1m':60000,'3m':180000,'5m':300000}[cfg.timeframe]||180000;
-    botTimer=setInterval(function(){tradingLoop().catch(function(e){log('ERROR','Timer: '+e.message);});},ms);
+    // ✅ 固定每1分鐘掃描一次，即時盯盤
+    botTimer=setInterval(function(){tradingLoop().catch(function(e){log('ERROR','Timer: '+e.message);});},60000);
     tradingLoop().catch(function(e){log('ERROR','Go: '+e.message);});
-    tg('🚀 Bybit 海馬啟動!\nTF:'+cfg.timeframe+' Lev:'+cfg.leverage+'x\nAmt:'+cfg.tradeAmount+'U SL:'+cfg.stopLossPercent+'% TP:'+cfg.takeProfitPercent+'%\n門檻:'+cfg.entryThreshold+'分\nSymbols:'+cfg.symbols.join(',')+'\nSelf-Learning: ON ✅',chatId);
+    tg('🚀 Bybit 海馬啟動!\nTF:'+cfg.timeframe+' Lev:'+cfg.leverage+'x\nAmt:'+cfg.tradeAmount+'U SL:'+cfg.stopLossPercent+'% TP:'+cfg.takeProfitPercent+'%\n門檻:'+cfg.entryThreshold+'分\n掃描:每1分鐘\nSymbols:'+cfg.symbols.join(',')+'\nSelf-Learning: ON ✅',chatId);
     return;
   }
 
