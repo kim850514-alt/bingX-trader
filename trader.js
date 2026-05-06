@@ -1,4 +1,4 @@
-"use strict";
+'use strict';
 const crypto=require('crypto'),https=require('https'),http=require('http'),fs=require('fs');
 const ENV={
   BINGX_API_KEY:process.env.BINGX_API_KEY||'',
@@ -9,7 +9,7 @@ const ENV={
 let cfg={
   timeframe:'5m',
   symbols:['BTC-USDT','ETH-USDT','SOL-USDT'],
-  tradeAmount:5,leverage:3,maxRiskPercent:10,
+  tradeAmount:50,leverage:3,maxRiskPercent:10,
   stopLossPercent:2.0,takeProfitPercent:5.0,
   allowShort:true,botRunning:false,
   maxPositions:999,
