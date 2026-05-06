@@ -322,12 +322,12 @@ async function checkPositions(){
       var tk=await getTicker(t.symbol).catch(function(){return null;});if(!tk)continue;
       var cur=parseFloat(tk.lastPrice);
       var holdMin=Math.round((Date.now()-t.openTime)/60000);
+      var ps=t.side;
+
       // 檢查是否已被 TP/SL 平倉
       var pos=await getPositions(t.symbol);
-      var ps=t.side;
       var stillOpen=pos.some(function(p){return p.positionSide===ps&&parseFloat(p.positionAmt||0)!==0;});
       if(!stillOpen&&holdMin>2){
-        // ✅ 從 BingX API 抓實際盈虧
         var actual=await getActualPnlBX(t.symbol,t.openTime);
         var pnl=actual?actual.pnl:(ps==='LONG'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage);
         var exitPrice=actual?actual.exitPrice:cur;
@@ -337,14 +337,70 @@ async function checkPositions(){
         tg('[BingX] '+(pnl>=0?'✅ 獲利':'❌ 虧損')+'\n'+t.symbol+'\n進場:'+t.entry.toFixed(4)+' 出場:'+exitPrice.toFixed(4)+'\nPnL('+source+'):'+(pnl>=0?'+':'')+pnl.toFixed(4)+'U Hold:'+holdMin+'min');
         continue;
       }
+
       var estPnl=ps==='LONG'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;
       log('INFO','持倉 '+t.symbol+' 估算:'+(estPnl>=0?'+':'')+estPnl.toFixed(2)+'U Hold:'+holdMin+'min');
+
+      // ✅ K線動態平倉：持倉超過5分鐘後，偵測反向訊號
+      if(holdMin>=5&&stillOpen){
+        var kl=await getKlines(t.symbol,cfg.timeframe,60).catch(function(){return[];});
+        if(kl.length>=30){
+          var closes=kl.map(function(k){return parseFloat(k[4]);});
+          var highs=kl.map(function(k){return parseFloat(k[2]);});
+          var lows=kl.map(function(k){return parseFloat(k[3]);});
+
+          var rsi=I.rsi(closes,cfg.params.rsiPeriod||7);
+          var ema9=I.ema(closes,9),ema21=I.ema(closes,21);
+          var macdData=I.macd(closes);
+          var bb=I.boll(closes,cfg.params.bbPeriod||15,cfg.params.bbStdDev||2);
+          var last=closes[closes.length-1];
+
+          var exitSignal=false;
+          var exitReason='';
+
+          if(ps==='LONG'){
+            // 多單反向訊號
+            var reverseScore=0;
+            if(rsi&&rsi>cfg.params.overbought){reverseScore+=2;exitReason+='RSI超買('+rsi.toFixed(0)+') ';}
+            if(ema9&&ema21&&ema9<ema21){reverseScore+=1;exitReason+='EMA空 ';}
+            if(macdData&&macdData.hist<0){reverseScore+=1;exitReason+='MACD- ';}
+            if(bb&&last>bb.upper){reverseScore+=2;exitReason+='BB上軌 ';}
+            if(reverseScore>=3){exitSignal=true;}
+          }else{
+            // 空單反向訊號
+            var reverseScore2=0;
+            if(rsi&&rsi<cfg.params.oversold){reverseScore2+=2;exitReason+='RSI超賣('+rsi.toFixed(0)+') ';}
+            if(ema9&&ema21&&ema9>ema21){reverseScore2+=1;exitReason+='EMA多 ';}
+            if(macdData&&macdData.hist>0){reverseScore2+=1;exitReason+='MACD+ ';}
+            if(bb&&last<bb.lower){reverseScore2+=2;exitReason+='BB下軌 ';}
+            if(reverseScore2>=3){exitSignal=true;}
+          }
+
+          if(exitSignal){
+            log('AI',t.symbol+' 偵測到反向訊號，提前平倉: '+exitReason);
+            var o3=await closePos(t.symbol,ps,t.qty).catch(function(){return null;});
+            if(o3){
+              await new Promise(function(res){setTimeout(res,1500);});
+              var actual3=await getActualPnlBX(t.symbol,t.openTime);
+              var pnl3=actual3?actual3.pnl:estPnl-(t.entry+cur)*t.qty*0.0005;
+              var exit3=actual3?actual3.exitPrice:cur;
+              var source3=actual3?'API實際':'估算';
+              recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:exit3,qty:t.qty,pnl:pnl3,holdMin:holdMin,reason:'反向平倉'});
+              delete openTrades[key];
+              tg('[BingX] 🔄 反向訊號平倉\n'+t.symbol+'\n原因:'+exitReason+'\nPnL('+source3+'):'+(pnl3>=0?'✅ +':'❌ ')+pnl3.toFixed(4)+'U Hold:'+holdMin+'min');
+              continue;
+            }
+          }
+        }
+      }
+
+      // 超時平倉
       if(holdMin>=cfg.maxHoldMin){
         var o=await closePos(t.symbol,ps,t.qty).catch(function(){return null;});
         if(o){
           await new Promise(function(res){setTimeout(res,1500);});
           var actual2=await getActualPnlBX(t.symbol,t.openTime);
-          var pnl2=actual2?actual2.pnl:(ps==='LONG'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage)-(t.entry+cur)*t.qty*0.0005;
+          var pnl2=actual2?actual2.pnl:estPnl-(t.entry+cur)*t.qty*0.0005;
           var exit2=actual2?actual2.exitPrice:cur;
           var source2=actual2?'API實際':'估算';
           recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:exit2,qty:t.qty,pnl:pnl2,holdMin:holdMin,reason:'超時平倉'});
