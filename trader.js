@@ -43,8 +43,18 @@ function recordTrade(t){
 }
 let brain=loadBrain();
 var learnCycleCount=0,learningPause=false;
-function loadBrain(){if(fs.existsSync('./bingx_brain.json'))try{return JSON.parse(fs.readFileSync('./bingx_brain.json','utf8'));}catch(e){}return{symbolPerf:{},hourPerf:{},errorPatterns:[],adjustHistory:[],learnCount:0,bestHours:[],worstHours:[],bestSymbols:[],worstSymbols:[],entryThresholdHistory:[]};}
-function saveBrain(){fs.writeFileSync('./bingx_brain.json',JSON.stringify(brain,null,2));}
+function loadBrain(){
+  // ✅ 共享學習數據
+  var paths=['./shared_brain.json','./bingx_brain.json'];
+  for(var i=0;i<paths.length;i++){
+    if(fs.existsSync(paths[i]))try{return JSON.parse(fs.readFileSync(paths[i],'utf8'));}catch(e){}
+  }
+  return{symbolPerf:{},hourPerf:{},errorPatterns:[],adjustHistory:[],learnCount:0,bestHours:[],worstHours:[],bestSymbols:[],worstSymbols:[],entryThresholdHistory:[]};
+}
+function saveBrain(){
+  fs.writeFileSync('./shared_brain.json',JSON.stringify(brain,null,2));
+  fs.writeFileSync('./bingx_brain.json',JSON.stringify(brain,null,2));
+}
 
 function learnFromTrade(t){
   brain.learnCount++;
