@@ -172,7 +172,26 @@ async function placeOrder(o){
     return null;
   }
 }
-async function closePos(sym,ps,qty){return placeOrder({symbol:sym,side:ps==='LONG'?'SELL':'BUY',positionSide:ps,quantity:qty});}
+// ✅ 從 BingX API 抓實際盈虧（含手續費）
+async function getActualPnlBX(symbol,openTime){
+  try{
+    var r=await bxReq('GET','/openApi/swap/v2/trade/allOrders',{symbol:symbol,limit:10});
+    if(r.code===0&&r.data&&r.data.orders&&r.data.orders.length>0){
+      var orders=r.data.orders.filter(function(o){
+        return o.status==='FILLED'&&parseInt(o.time||o.updateTime||0)>openTime&&(o.side==='SELL'||o.positionSide==='SHORT');
+      });
+      if(orders.length>0){
+        var latest=orders[0];
+        var profit=parseFloat(latest.profit||0);
+        var commission=parseFloat(latest.commission||0);
+        var pnlNet=profit+commission; // commission 通常是負數
+        log('INFO','BingX API實際PnL: profit='+profit+' commission='+commission+' net='+pnlNet.toFixed(4)+'U');
+        return{pnl:pnlNet,exitPrice:parseFloat(latest.avgPrice||0),source:'api'};
+      }
+    }
+  }catch(e){log('WARN','getActualPnlBX: '+e.message);}
+  return null;
+}
 
 // 數量步進
 function getQtyStep(price){
@@ -308,12 +327,14 @@ async function checkPositions(){
       var ps=t.side;
       var stillOpen=pos.some(function(p){return p.positionSide===ps&&parseFloat(p.positionAmt||0)!==0;});
       if(!stillOpen&&holdMin>2){
-        var pnl=ps==='LONG'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;
-        var fee=(t.entry+cur)*t.qty*0.0005;
-        var pnlNet=pnl-fee;
-        recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnlNet,holdMin:holdMin,reason:'TP/SL觸發'});
+        // ✅ 從 BingX API 抓實際盈虧
+        var actual=await getActualPnlBX(t.symbol,t.openTime);
+        var pnl=actual?actual.pnl:(ps==='LONG'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage);
+        var exitPrice=actual?actual.exitPrice:cur;
+        var source=actual?'API實際':'估算';
+        recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:exitPrice,qty:t.qty,pnl:pnl,holdMin:holdMin,reason:'TP/SL觸發'});
         delete openTrades[key];
-        tg('[BingX] '+(pnlNet>=0?'✅ 獲利':'❌ 虧損')+'\n'+t.symbol+'\n進場:'+t.entry.toFixed(4)+' 出場:'+cur.toFixed(4)+'\nPnL:'+(pnlNet>=0?'+':'')+pnlNet.toFixed(2)+'U Hold:'+holdMin+'min');
+        tg('[BingX] '+(pnl>=0?'✅ 獲利':'❌ 虧損')+'\n'+t.symbol+'\n進場:'+t.entry.toFixed(4)+' 出場:'+exitPrice.toFixed(4)+'\nPnL('+source+'):'+(pnl>=0?'+':'')+pnl.toFixed(4)+'U Hold:'+holdMin+'min');
         continue;
       }
       var estPnl=ps==='LONG'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;
@@ -321,11 +342,14 @@ async function checkPositions(){
       if(holdMin>=cfg.maxHoldMin){
         var o=await closePos(t.symbol,ps,t.qty).catch(function(){return null;});
         if(o){
-          var pnl2=ps==='LONG'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;
-          var fee2=(t.entry+cur)*t.qty*0.0005;
-          recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl2-fee2,holdMin:holdMin,reason:'超時平倉'});
+          await new Promise(function(res){setTimeout(res,1500);});
+          var actual2=await getActualPnlBX(t.symbol,t.openTime);
+          var pnl2=actual2?actual2.pnl:(ps==='LONG'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage)-(t.entry+cur)*t.qty*0.0005;
+          var exit2=actual2?actual2.exitPrice:cur;
+          var source2=actual2?'API實際':'估算';
+          recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:exit2,qty:t.qty,pnl:pnl2,holdMin:holdMin,reason:'超時平倉'});
           delete openTrades[key];
-          tg('[BingX] ⏰ 超時平倉\n'+t.symbol+'\nPnL:'+(pnl2>=0?'✅ +':'❌ ')+(pnl2-fee2).toFixed(2)+'U Hold:'+holdMin+'min');
+          tg('[BingX] ⏰ 超時平倉\n'+t.symbol+'\nPnL('+source2+'):'+(pnl2>=0?'✅ +':'❌ ')+pnl2.toFixed(4)+'U Hold:'+holdMin+'min');
         }
       }
     }catch(e){log('ERROR','checkPos: '+e.message);}
