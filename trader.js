@@ -9,7 +9,7 @@ const ENV={
 let cfg={
   timeframe:'5m',
   symbols:['BTC-USDT','ETH-USDT','SOL-USDT'],
-  tradeAmount:50,leverage:3,maxRiskPercent:10,
+  tradeAmount:5,leverage:3,maxRiskPercent:10,
   stopLossPercent:2.0,takeProfitPercent:5.0,
   allowShort:true,botRunning:false,
   maxPositions:999,
