@@ -1,4 +1,4 @@
-'use strict';
+"use strict";
 const crypto=require('crypto'),https=require('https'),http=require('http'),fs=require('fs');
 const ENV={
   BINGX_API_KEY:process.env.BINGX_API_KEY||'',
