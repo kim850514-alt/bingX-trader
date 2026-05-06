@@ -459,12 +459,11 @@ async function checkPositions(){
       var cur=parseFloat(tk.lastPrice);
       var holdMin=Math.round((Date.now()-t.openTime)/60000);
 
-      // ✅ 先檢查 Bybit 上是否已經平倉（被 TP/SL 觸發）
+      // 先檢查 Bybit 上是否已經平倉（被 TP/SL 觸發）
       var pos=await getPositions(t.symbol);
       var stillOpen=pos.some(function(p){return parseFloat(p.size||0)!==0;});
 
       if(!stillOpen&&holdMin>1){
-        // 已被交易所平倉，抓實際 PnL
         var actual=await getActualPnl(t.symbol,t.openTime);
         var pnl=actual?actual.pnl:(t.side==='Buy'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage);
         var exitPrice=actual?actual.exitPrice:cur;
@@ -477,7 +476,6 @@ async function checkPositions(){
         continue;
       }
 
-      // 估算當前盈虧（含資金費率）
       var estPnl=t.side==='Buy'?(cur-t.entry)*t.qty*cfg.leverage:(t.entry-cur)*t.qty*cfg.leverage;
       var estFee=(t.entry+cur)*t.qty*0.00055;
       var posVal=cur*t.qty;
@@ -485,10 +483,56 @@ async function checkPositions(){
       var estNet=estPnl-estFee-fundingCost;
       log('INFO','持倉 '+t.symbol+' 估算PnL:'+(estPnl>=0?'+':'')+estPnl.toFixed(2)+'U 手續費:-'+estFee.toFixed(3)+'U 資金費率:-'+fundingCost.toFixed(3)+'U 淨:'+(estNet>=0?'+':'')+estNet.toFixed(2)+'U Hold:'+holdMin+'min');
 
+      // ✅ K線動態平倉：持倉超過5分鐘後偵測反向訊號
+      if(holdMin>=5&&stillOpen){
+        var kl=await getKlines(t.symbol,cfg.timeframe,60).catch(function(){return[];});
+        if(kl.length>=30){
+          var closes=kl.map(function(k){return parseFloat(k[4]);}).reverse();
+          var highs=kl.map(function(k){return parseFloat(k[2]);}).reverse();
+          var lows=kl.map(function(k){return parseFloat(k[3]);}).reverse();
+          var rsi=I.rsi(closes,cfg.params.rsiPeriod||7);
+          var ema9=I.ema(closes,9),ema21=I.ema(closes,21);
+          var macdData=I.macd(closes);
+          var bb=I.boll(closes,cfg.params.bbPeriod||15,cfg.params.bbStdDev||2);
+          var last=closes[closes.length-1];
+          var exitSignal=false,exitReason='';
+
+          if(t.side==='Buy'){
+            var rs=0;
+            if(rsi&&rsi>cfg.params.overbought){rs+=2;exitReason+='RSI超買('+rsi.toFixed(0)+') ';}
+            if(ema9&&ema21&&ema9<ema21){rs+=1;exitReason+='EMA空 ';}
+            if(macdData&&macdData.hist<0){rs+=1;exitReason+='MACD- ';}
+            if(bb&&last>bb.upper){rs+=2;exitReason+='BB上軌 ';}
+            if(rs>=3)exitSignal=true;
+          }else{
+            var rs2=0;
+            if(rsi&&rsi<cfg.params.oversold){rs2+=2;exitReason+='RSI超賣('+rsi.toFixed(0)+') ';}
+            if(ema9&&ema21&&ema9>ema21){rs2+=1;exitReason+='EMA多 ';}
+            if(macdData&&macdData.hist>0){rs2+=1;exitReason+='MACD+ ';}
+            if(bb&&last<bb.lower){rs2+=2;exitReason+='BB下軌 ';}
+            if(rs2>=3)exitSignal=true;
+          }
+
+          if(exitSignal){
+            log('AI',t.symbol+' 反向訊號，提前平倉: '+exitReason);
+            var o3=await closePos(t.symbol,t.side,t.qty).catch(function(){return null;});
+            if(o3){
+              await new Promise(function(res){setTimeout(res,1000);});
+              var actual3=await getActualPnl(t.symbol,t.openTime);
+              var pnl3=actual3?actual3.pnl:estNet;
+              var exit3=actual3?actual3.exitPrice:cur;
+              recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:exit3,qty:t.qty,pnl:pnl3,holdMin:holdMin,reason:'反向平倉'});
+              delete openTrades[key];
+              tg('[Bybit] 🔄 反向訊號平倉\n'+t.symbol+'\n原因:'+exitReason+'\n實際PnL:'+(pnl3>=0?'✅ +':'❌ ')+pnl3.toFixed(2)+'U Hold:'+holdMin+'min');
+              continue;
+            }
+          }
+        }
+      }
+
       if(holdMin>=cfg.maxHoldMin){
         var o=await closePos(t.symbol,t.side,t.qty).catch(function(){return null;});
         if(o){
-          // 等一秒讓交易所結算
           await new Promise(function(res){setTimeout(res,1000);});
           var actual2=await getActualPnl(t.symbol,t.openTime);
           var pnl2=actual2?actual2.pnl:estPnl-estFee;
