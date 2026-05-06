@@ -117,8 +117,8 @@ function log(lv,msg){console.log('['+nowTW()+'][BX]['+lv+'] '+msg);memLog.push({
 function bxSign(qs){return crypto.createHmac('sha256',ENV.BINGX_SECRET).update(qs).digest('hex');}
 function bxBuildQ(params){
   var p=Object.assign({},params,{timestamp:Date.now()});
-  // ✅ BingX 簽名：直接用原始值組合字串（不做 URL encode）
-  var qs=Object.keys(p).sort().filter(function(k){return p[k]!=null&&p[k]!=='';}).map(function(k){return k+'='+p[k];}).join('&');
+  // BingX 簽名：不排序，直接組合
+  var qs=Object.keys(p).filter(function(k){return p[k]!=null&&p[k]!=='';}).map(function(k){return k+'='+p[k];}).join('&');
   var sig=bxSign(qs);
   return qs+'&signature='+sig;
 }
