@@ -9,7 +9,7 @@ const ENV={
 let cfg={
   timeframe:'5m',
   symbols:['BTC-USDT','ETH-USDT','SOL-USDT'],
-  tradeAmount:5,leverage:3,maxRiskPercent:10,
+  tradeAmount:50,leverage:3,maxRiskPercent:10,
   stopLossPercent:2.0,takeProfitPercent:5.0,
   allowShort:true,botRunning:false,
   maxPositions:999,
@@ -185,32 +185,64 @@ async function placeOrder(o){
 // ✅ 從 BingX API 抓實際盈虧（含手續費）
 async function getActualPnlBX(symbol,openTime){
   try{
-    var r=await bxReq('GET','/openApi/swap/v2/trade/allOrders',{symbol:symbol,limit:10});
+    var r=await bxReq('GET','/openApi/swap/v2/trade/allOrders',{symbol:symbol,limit:20});
     if(r.code===0&&r.data&&r.data.orders&&r.data.orders.length>0){
+      // 找開倉後的平倉訂單（SELL平多 或 BUY平空）
       var orders=r.data.orders.filter(function(o){
-        return o.status==='FILLED'&&parseInt(o.time||o.updateTime||0)>openTime&&(o.side==='SELL'||o.positionSide==='SHORT');
+        var oTime=parseInt(o.time||o.updateTime||o.createdTime||0);
+        return o.status==='FILLED'&&oTime>openTime&&parseFloat(o.profit||0)!==0;
       });
       if(orders.length>0){
+        // 取最近一筆有盈虧的
         var latest=orders[0];
         var profit=parseFloat(latest.profit||0);
         var commission=parseFloat(latest.commission||0);
-        var pnlNet=profit+commission; // commission 通常是負數
+        var pnlNet=profit+commission;
         log('INFO','BingX API實際PnL: profit='+profit+' commission='+commission+' net='+pnlNet.toFixed(4)+'U');
         return{pnl:pnlNet,exitPrice:parseFloat(latest.avgPrice||0),source:'api'};
+      }
+      // 備用：找任何有profit的訂單
+      var anyOrders=r.data.orders.filter(function(o){
+        return o.status==='FILLED'&&parseFloat(o.profit||0)!==0;
+      });
+      if(anyOrders.length>0){
+        var a=anyOrders[0];
+        var p2=parseFloat(a.profit||0)+parseFloat(a.commission||0);
+        log('INFO','BingX備用PnL: '+p2.toFixed(4)+'U');
+        return{pnl:p2,exitPrice:parseFloat(a.avgPrice||0),source:'api'};
       }
     }
   }catch(e){log('WARN','getActualPnlBX: '+e.message);}
   return null;
 }
 
-// 數量步進
+// ✅ 從 BingX API 抓實際進場價
+async function getActualEntryPrice(symbol,openTime){
+  try{
+    var r=await bxReq('GET','/openApi/swap/v2/trade/allOrders',{symbol:symbol,limit:10});
+    if(r.code===0&&r.data&&r.data.orders&&r.data.orders.length>0){
+      var orders=r.data.orders.filter(function(o){
+        var oTime=parseInt(o.time||o.updateTime||o.createdTime||0);
+        return o.status==='FILLED'&&Math.abs(oTime-openTime)<30000&&(o.side==='BUY'||o.side==='SELL');
+      });
+      if(orders.length>0){
+        var entryPrice=parseFloat(orders[0].avgPrice||0);
+        if(entryPrice>0){log('INFO','實際進場價: '+entryPrice);return entryPrice;}
+      }
+    }
+  }catch(e){log('WARN','getActualEntryPrice: '+e.message);}
+  return null;
+}
+
+// 數量步進（BingX 實際最小交易量）
 function getQtyStep(price){
-  if(price>=10000)return 0.001;
-  if(price>=1000)return 0.01;
-  if(price>=100)return 0.1;
-  if(price>=1)return 1;
-  if(price>=0.001)return 10;
-  return 100;
+  if(price>=10000)return 0.001;  // BTC
+  if(price>=1000)return 0.01;   // ETH
+  if(price>=100)return 0.1;     // SOL BNB
+  if(price>=1)return 1;         // XRP
+  if(price>=0.01)return 10;     // DOGE
+  if(price>=0.001)return 100;   // PEPE 等小幣
+  return 1000;
 }
 function roundQty(qty,step){return Math.floor(qty/step)*step;}
 
@@ -313,11 +345,19 @@ async function tradingLoop(){
         var hasShort=pos.some(function(p){return p.positionSide==='SHORT'&&parseFloat(p.positionAmt||0)!==0;})||openTrades[sym+'_S'];
         if(signal==='BUY'&&!hasLong&&!hasShort){
           var o=await placeOrder({symbol:sym,side:'BUY',positionSide:'LONG',quantity:qty,stopLoss:slP,takeProfit:tpP});
-          if(o)openTrades[sym+'_L']={symbol:sym,side:'LONG',entry:cur,qty:qty,reason:reasons,openTime:Date.now()};
+          if(o){
+            var actualEntry=await getActualEntryPrice(sym,Date.now()).catch(function(){return null;});
+            openTrades[sym+'_L']={symbol:sym,side:'LONG',entry:actualEntry||cur,qty:qty,reason:reasons,openTime:Date.now()};
+            log('INFO',sym+' 實際進場價:'+(actualEntry||cur));
+          }
         }
         if(signal==='SELL'&&cfg.allowShort&&!hasLong&&!hasShort){
           var o2=await placeOrder({symbol:sym,side:'SELL',positionSide:'SHORT',quantity:qty,stopLoss:slP,takeProfit:tpP});
-          if(o2)openTrades[sym+'_S']={symbol:sym,side:'SHORT',entry:cur,qty:qty,reason:reasons,openTime:Date.now()};
+          if(o2){
+            var actualEntry2=await getActualEntryPrice(sym,Date.now()).catch(function(){return null;});
+            openTrades[sym+'_S']={symbol:sym,side:'SHORT',entry:actualEntry2||cur,qty:qty,reason:reasons,openTime:Date.now()};
+            log('INFO',sym+' 實際進場價:'+(actualEntry2||cur));
+          }
         }
       }catch(e){log('ERROR',sym+': '+e.message);}
     }
