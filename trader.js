@@ -9,7 +9,7 @@ const ENV={
 let cfg={
   timeframe:'5m',
   symbols:['BTC-USDT','ETH-USDT','SOL-USDT'],
-  tradeAmount:50,leverage:3,maxRiskPercent:10,
+  tradeAmount:5,leverage:5,maxRiskPercent:10,
   stopLossPercent:2.0,takeProfitPercent:5.0,
   allowShort:true,botRunning:false,
   maxPositions:999,
@@ -183,33 +183,30 @@ async function placeOrder(o){
   }
 }
 // ✅ 從 BingX API 抓實際盈虧（含手續費）
+var usedOrderIds=new Set(); // 追蹤已用過的訂單 ID
+
 async function getActualPnlBX(symbol,openTime){
   try{
     var r=await bxReq('GET','/openApi/swap/v2/trade/allOrders',{symbol:symbol,limit:20});
     if(r.code===0&&r.data&&r.data.orders&&r.data.orders.length>0){
-      // 找開倉後的平倉訂單（SELL平多 或 BUY平空）
       var orders=r.data.orders.filter(function(o){
         var oTime=parseInt(o.time||o.updateTime||o.createdTime||0);
-        return o.status==='FILLED'&&oTime>openTime&&parseFloat(o.profit||0)!==0;
+        var orderId=String(o.orderId||'');
+        // 過濾：已成交、有盈虧、時間在開倉後、未使用過的訂單
+        return o.status==='FILLED'&&
+               oTime>openTime&&
+               parseFloat(o.profit||0)!==0&&
+               !usedOrderIds.has(orderId);
       });
       if(orders.length>0){
-        // 取最近一筆有盈虧的
         var latest=orders[0];
+        var orderId=String(latest.orderId||'');
+        usedOrderIds.add(orderId); // 標記已用
         var profit=parseFloat(latest.profit||0);
         var commission=parseFloat(latest.commission||0);
         var pnlNet=profit+commission;
-        log('INFO','BingX API實際PnL: profit='+profit+' commission='+commission+' net='+pnlNet.toFixed(4)+'U');
-        return{pnl:pnlNet,exitPrice:parseFloat(latest.avgPrice||0),source:'api'};
-      }
-      // 備用：找任何有profit的訂單
-      var anyOrders=r.data.orders.filter(function(o){
-        return o.status==='FILLED'&&parseFloat(o.profit||0)!==0;
-      });
-      if(anyOrders.length>0){
-        var a=anyOrders[0];
-        var p2=parseFloat(a.profit||0)+parseFloat(a.commission||0);
-        log('INFO','BingX備用PnL: '+p2.toFixed(4)+'U');
-        return{pnl:p2,exitPrice:parseFloat(a.avgPrice||0),source:'api'};
+        log('INFO','BingX API實際PnL: orderId='+orderId+' profit='+profit+' commission='+commission+' net='+pnlNet.toFixed(4)+'U');
+        return{pnl:pnlNet,exitPrice:parseFloat(latest.avgPrice||0),source:'api',orderId:orderId};
       }
     }
   }catch(e){log('WARN','getActualPnlBX: '+e.message);}
@@ -580,6 +577,38 @@ function scheduleReport(){
   },ms10());
 }
 
+// ✅ 啟動時從 BingX API 恢復現有持倉
+async function recoverPositions(){
+  try{
+    var pos=await getPositions();
+    if(!pos||pos.length===0){log('INFO','無需恢復持倉');return;}
+    var recovered=0;
+    for(var i=0;i<pos.length;i++){
+      var p=pos[i];
+      var amt=parseFloat(p.positionAmt||0);
+      if(amt===0)continue;
+      var sym=p.symbol;
+      var side=p.positionSide||'LONG';
+      var key=sym+'_'+(side==='LONG'?'L':'S');
+      if(openTrades[key])continue; // 已有記錄
+      var entryPrice=parseFloat(p.avgPrice||p.entryPrice||0);
+      openTrades[key]={
+        symbol:sym,
+        side:side,
+        entry:entryPrice,
+        qty:Math.abs(amt),
+        reason:'恢復持倉',
+        openTime:Date.now()-30*60000 // 假設開倉30分鐘前
+      };
+      recovered++;
+      log('INFO','恢復持倉: '+sym+' '+side+' entry:'+entryPrice+' qty:'+Math.abs(amt));
+    }
+    if(recovered>0){
+      tg('[BingX] 🔄 恢復 '+recovered+' 個持倉\n'+(Object.keys(openTrades).map(function(k){var t=openTrades[k];return t.symbol+' '+t.side;}).join('\n')));
+    }
+  }catch(e){log('WARN','recoverPositions: '+e.message);}
+}
+
 async function main(){
   console.log('\nBingX Seahorse AutoTrader v1.0\n');
   log('INFO','Starting...');
@@ -588,6 +617,8 @@ async function main(){
     var bal=await getBalance();
     log('OK','BingX API OK! Available:'+bal.available.toFixed(2)+'U');
     tg('[BingX 海馬] 🟢 上線!\n餘額:'+bal.available.toFixed(2)+'U\nSelf-Learning: ON ✅\n/help 查看指令');
+    // ✅ 恢復現有持倉
+    await recoverPositions();
   }catch(e){log('ERROR','API fail: '+e.message);tg('[BingX] ⚠️ Warning: '+e.message);}
   log('INFO','Starting Telegram polling...');
   tgPoll();scheduleReport();
