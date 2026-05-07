@@ -469,15 +469,24 @@ function tg(text,chatId){
 var lastUpdateId=0;
 function tgPoll(){
   if(!ENV.TG_TOKEN)return;
-  var req=https.request({hostname:'api.telegram.org',path:'/bot'+ENV.TG_TOKEN+'/getUpdates?offset='+(lastUpdateId+1)+'&timeout=30&limit=10',method:'GET'},function(res){
+  var req=https.request({hostname:'api.telegram.org',path:'/bot'+ENV.TG_TOKEN+'/getUpdates?offset='+(lastUpdateId+1)+'&timeout=10&limit=5',method:'GET'},function(res){
     var d='';res.on('data',function(c){d+=c;});
     res.on('end',function(){
-      try{var json=JSON.parse(d);if(json.ok&&json.result&&json.result.length>0){json.result.forEach(function(u){if(u.update_id>lastUpdateId)lastUpdateId=u.update_id;handleUpdate(u);});}}catch(e){}
-      setTimeout(tgPoll,1000);
+      try{
+        var json=JSON.parse(d);
+        if(json.ok&&json.result&&json.result.length>0){
+          json.result.forEach(function(u){
+            if(u.update_id>lastUpdateId)lastUpdateId=u.update_id;
+            // 用 setImmediate 優先處理指令
+            setImmediate(function(){handleUpdate(u);});
+          });
+        }
+      }catch(e){}
+      setTimeout(tgPoll,500);
     });
   });
   req.on('error',function(){setTimeout(tgPoll,5000);});
-  req.setTimeout(35000,function(){req.destroy();setTimeout(tgPoll,1000);});
+  req.setTimeout(15000,function(){req.destroy();setTimeout(tgPoll,1000);});
   req.end();
 }
 
@@ -514,7 +523,11 @@ function handleUpdate(update){
     tg('[BingX] 🧠 學習狀態\n已學習:'+brain.learnCount+'次\n最佳時段:'+(brain.bestHours.join(',')+'時'||'學習中')+'\n迴避時段:'+(brain.worstHours.join(',')+'時'||'無')+'\n最佳品種:'+(brain.bestSymbols.join(',')||'學習中')+'\n迴避品種:'+(brain.worstSymbols.join(',')||'無')+'\n調參:'+brain.adjustHistory.length+'次\n最近:'+lastAdj.changes.join(', '),chatId);return;
   }
 
-  if(cmd==='/log'){tg('[BingX] 日誌\n'+memLog.slice(-15).map(function(l){return '['+l.lv+'] '+l.msg;}).join('\n'),chatId);return;}
+  if(cmd==='/log'){
+    var logs=memLog.slice(-15).map(function(l){return '['+l.lv+'] '+l.msg.slice(0,80);}).join('\n');
+    tg('[BingX] 最近日誌\n'+(logs||'無日誌'),chatId);
+    return;
+  }
 
   if(cmd==='/params'){
     var p=cfg.params;
