@@ -8,7 +8,7 @@ const ENV={
 };
 let cfg={
   timeframe:'5m',
-  symbols:['BTC-USDT','ETH-USDT','SOL-USDT'],
+ symbols:['DOGE-USDT','XRP-USDT','ADA-USDT'],
   tradeAmount:5,leverage:5,maxRiskPercent:10,
   stopLossPercent:2.0,takeProfitPercent:5.0,
   allowShort:true,botRunning:false,
