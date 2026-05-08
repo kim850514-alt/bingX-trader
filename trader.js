@@ -330,8 +330,11 @@ async function tradingLoop(){
         var amt=Math.min(cfg.tradeAmount,bal.available*(cfg.maxRiskPercent/100));
         if(amt<5){log('WARN',sym+' 餘額不足');continue;}
         var step=getQtyStep(cur);
-        var qty=roundQty(amt*cfg.leverage/cur,step);
+        // ✅ 跟海馬一樣：amt 是保證金，名義價值 = amt × 槓桿
+        var notional=amt*cfg.leverage;
+        var qty=roundQty(notional/cur,step);
         if(qty<=0){log('WARN',sym+' 數量為0');continue;}
+        log('INFO',sym+' 數量計算: 保證金='+amt.toFixed(2)+'U × '+cfg.leverage+'x = '+notional.toFixed(2)+'U / '+cur+' = '+qty);
         var atrVal=atrV||cur*0.01;
         var slD=Math.max(atrVal*1.5,cur*cfg.stopLossPercent/100);
         var tpD=Math.max(atrVal*3.0,cur*cfg.takeProfitPercent/100);
