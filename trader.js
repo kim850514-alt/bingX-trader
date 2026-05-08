@@ -8,7 +8,7 @@ const ENV={
 };
 let cfg={
   timeframe:'5m',
- symbols:['DOGE-USDT','XRP-USDT','ADA-USDT'],
+  symbols:['BTC-USDT','ETH-USDT','SOL-USDT'],
   tradeAmount:5,leverage:5,maxRiskPercent:10,
   stopLossPercent:2.0,takeProfitPercent:5.0,
   allowShort:true,botRunning:false,
@@ -163,18 +163,25 @@ async function setLev(sym,lev){var sides=['LONG','SHORT'];for(var i=0;i<sides.le
 
 async function placeOrder(o){
   if(cfg.leverage>1)await setLev(o.symbol,cfg.leverage);
-  var p={symbol:o.symbol,side:o.side,positionSide:o.positionSide||'LONG',type:'MARKET',quantity:String(o.quantity)};
-  log('INFO','下單 '+o.side+' '+o.symbol+' x'+o.quantity+' SL:'+o.stopLoss+' TP:'+o.takeProfit);
+  // ✅ 按價值下單：用 quoteOrderQty 指定 USDT 金額
+  var p={symbol:o.symbol,side:o.side,positionSide:o.positionSide||'LONG',type:'MARKET'};
+  if(o.quoteQty){
+    p.quoteOrderQty=String(o.quoteQty); // 按 USDT 價值下單
+  }else{
+    p.quantity=String(o.quantity);
+  }
+  log('INFO','下單 '+o.side+' '+o.symbol+(o.quoteQty?' $'+o.quoteQty+'U':' x'+o.quantity)+' SL:'+o.stopLoss+' TP:'+o.takeProfit);
   var r=await bxReq('POST','/openApi/swap/v2/trade/order',p);
   if(r.code===0){
     var ps=o.positionSide||'LONG';
     var closeSide=ps==='LONG'?'SELL':'BUY';
+    var actualQty=o.quantity||(r.data&&r.data.order&&r.data.order.executedQty)||o.quoteQty;
     // 獨立止損單
-    if(o.stopLoss){try{await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:o.symbol,side:closeSide,positionSide:ps,type:'STOP_MARKET',stopPrice:String(o.stopLoss),quantity:String(o.quantity),workingType:'MARK_PRICE'});log('OK','止損設定 '+o.stopLoss);}catch(e){log('WARN','止損失敗: '+e.message);}}
+    if(o.stopLoss){try{await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:o.symbol,side:closeSide,positionSide:ps,type:'STOP_MARKET',stopPrice:String(o.stopLoss),quantity:String(actualQty),workingType:'MARK_PRICE'});log('OK','止損設定 '+o.stopLoss);}catch(e){log('WARN','止損失敗: '+e.message);}}
     // 獨立止盈單
-    if(o.takeProfit){try{await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:o.symbol,side:closeSide,positionSide:ps,type:'TAKE_PROFIT_MARKET',stopPrice:String(o.takeProfit),quantity:String(o.quantity),workingType:'MARK_PRICE'});log('OK','止盈設定 '+o.takeProfit);}catch(e){log('WARN','止盈失敗: '+e.message);}}
+    if(o.takeProfit){try{await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:o.symbol,side:closeSide,positionSide:ps,type:'TAKE_PROFIT_MARKET',stopPrice:String(o.takeProfit),quantity:String(actualQty),workingType:'MARK_PRICE'});log('OK','止盈設定 '+o.takeProfit);}catch(e){log('WARN','止盈失敗: '+e.message);}}
     log('OK','開單成功 '+o.side+' '+o.symbol);
-    tg('[BingX] ✅ 開單成功\n'+(o.side==='BUY'?'🟢 多單':'🔴 空單')+' '+o.symbol+'\n數量:'+o.quantity+'\nSL:'+o.stopLoss+'\nTP:'+o.takeProfit);
+    tg('[BingX] ✅ 開單成功\n'+(o.side==='BUY'?'🟢 多單':'🔴 空單')+' '+o.symbol+(o.quoteQty?'\n價值:'+o.quoteQty+'U':'\n數量:'+o.quantity)+'\nSL:'+o.stopLoss+'\nTP:'+o.takeProfit);
     return r.data.order;
   }else{
     log('ERROR','開單失敗 ['+r.code+'] '+r.msg);
@@ -189,13 +196,13 @@ async function getActualPnlBX(symbol,openTime){
   try{
     var r=await bxReq('GET','/openApi/swap/v2/trade/allOrders',{symbol:symbol,limit:20});
     if(r.code===0&&r.data&&r.data.orders&&r.data.orders.length>0){
+      // 找平倉單：SELL LONG 或 BUY SHORT，FILLED，時間在開倉後
       var orders=r.data.orders.filter(function(o){
         var oTime=parseInt(o.time||o.updateTime||0);
         var orderId=String(o.orderId||'');
-        var profit=parseFloat(o.profit||0);
-        // 找平倉單：FILLED、有盈虧（非0）、時間在開倉後、未使用過
+        var isClose=(o.side==='SELL'&&o.positionSide==='LONG')||(o.side==='BUY'&&o.positionSide==='SHORT');
         return o.status==='FILLED'&&
-               profit!==0&&
+               isClose&&
                oTime>openTime&&
                !usedOrderIds.has(orderId);
       });
@@ -332,11 +339,11 @@ async function tradingLoop(){
         var amt=Math.min(cfg.tradeAmount,bal.available*(cfg.maxRiskPercent/100));
         if(amt<5){log('WARN',sym+' 餘額不足');continue;}
         var step=getQtyStep(cur);
-        // ✅ 跟海馬一樣：amt 是保證金，名義價值 = amt × 槓桿
+        // ✅ amount 是保證金，名義價值 = amount × 槓桿
         var notional=amt*cfg.leverage;
         var qty=roundQty(notional/cur,step);
         if(qty<=0){log('WARN',sym+' 數量為0');continue;}
-        log('INFO',sym+' 數量計算: 保證金='+amt.toFixed(2)+'U × '+cfg.leverage+'x = '+notional.toFixed(2)+'U / '+cur+' = '+qty);
+        log('INFO',sym+' 保證金:'+amt.toFixed(2)+'U 名義:'+notional.toFixed(2)+'U qty:'+qty);
         var atrVal=atrV||cur*0.01;
         var slD=Math.max(atrVal*1.5,cur*cfg.stopLossPercent/100);
         var tpD=Math.max(atrVal*3.0,cur*cfg.takeProfitPercent/100);
@@ -346,7 +353,7 @@ async function tradingLoop(){
         var hasLong=pos.some(function(p){return p.positionSide==='LONG'&&parseFloat(p.positionAmt||0)!==0;})||openTrades[sym+'_L'];
         var hasShort=pos.some(function(p){return p.positionSide==='SHORT'&&parseFloat(p.positionAmt||0)!==0;})||openTrades[sym+'_S'];
         if(signal==='BUY'&&!hasLong&&!hasShort){
-          var o=await placeOrder({symbol:sym,side:'BUY',positionSide:'LONG',quantity:qty,stopLoss:slP,takeProfit:tpP});
+          var o=await placeOrder({symbol:sym,side:'BUY',positionSide:'LONG',quoteQty:notional,stopLoss:slP,takeProfit:tpP});
           if(o){
             var actualEntry=await getActualEntryPrice(sym,Date.now()).catch(function(){return null;});
             openTrades[sym+'_L']={symbol:sym,side:'LONG',entry:actualEntry||cur,qty:qty,reason:reasons,openTime:Date.now()};
@@ -354,7 +361,7 @@ async function tradingLoop(){
           }
         }
         if(signal==='SELL'&&cfg.allowShort&&!hasLong&&!hasShort){
-          var o2=await placeOrder({symbol:sym,side:'SELL',positionSide:'SHORT',quantity:qty,stopLoss:slP,takeProfit:tpP});
+          var o2=await placeOrder({symbol:sym,side:'SELL',positionSide:'SHORT',quoteQty:notional,stopLoss:slP,takeProfit:tpP});
           if(o2){
             var actualEntry2=await getActualEntryPrice(sym,Date.now()).catch(function(){return null;});
             openTrades[sym+'_S']={symbol:sym,side:'SHORT',entry:actualEntry2||cur,qty:qty,reason:reasons,openTime:Date.now()};
