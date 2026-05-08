@@ -8,7 +8,7 @@ const ENV={
 };
 let cfg={
   timeframe:'5m',
-  symbols:['doge-USDT','siren-USDT','xrp-USDT'],
+  symbols:['Doge-USDT','Siren-USDT','Xrp-USDT'],
   tradeAmount:5,leverage:5,maxRiskPercent:10,
   stopLossPercent:2.0,takeProfitPercent:5.0,
   allowShort:true,botRunning:false,
