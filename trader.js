@@ -8,7 +8,7 @@ const ENV={
 };
 let cfg={
   timeframe:'5m',
-  symbols:['BTC-USDT','ETH-USDT','SOL-USDT'],
+  symbols:['doge-USDT','siren-USDT','xrp-USDT'],
   tradeAmount:5,leverage:5,maxRiskPercent:10,
   stopLossPercent:2.0,takeProfitPercent:5.0,
   allowShort:true,botRunning:false,
@@ -183,30 +183,32 @@ async function placeOrder(o){
   }
 }
 // ✅ 從 BingX API 抓實際盈虧（含手續費）
-var usedOrderIds=new Set(); // 追蹤已用過的訂單 ID
+var usedOrderIds=new Set();
 
 async function getActualPnlBX(symbol,openTime){
   try{
     var r=await bxReq('GET','/openApi/swap/v2/trade/allOrders',{symbol:symbol,limit:20});
     if(r.code===0&&r.data&&r.data.orders&&r.data.orders.length>0){
       var orders=r.data.orders.filter(function(o){
-        var oTime=parseInt(o.time||o.updateTime||o.createdTime||0);
+        var oTime=parseInt(o.time||o.updateTime||0);
         var orderId=String(o.orderId||'');
-        // 過濾：已成交、有盈虧、時間在開倉後、未使用過的訂單
+        var profit=parseFloat(o.profit||0);
+        // 找平倉單：FILLED、有盈虧（非0）、時間在開倉後、未使用過
         return o.status==='FILLED'&&
+               profit!==0&&
                oTime>openTime&&
-               parseFloat(o.profit||0)!==0&&
                !usedOrderIds.has(orderId);
       });
       if(orders.length>0){
         var latest=orders[0];
         var orderId=String(latest.orderId||'');
-        usedOrderIds.add(orderId); // 標記已用
+        usedOrderIds.add(orderId);
         var profit=parseFloat(latest.profit||0);
         var commission=parseFloat(latest.commission||0);
         var pnlNet=profit+commission;
-        log('INFO','BingX API實際PnL: orderId='+orderId+' profit='+profit+' commission='+commission+' net='+pnlNet.toFixed(4)+'U');
-        return{pnl:pnlNet,exitPrice:parseFloat(latest.avgPrice||0),source:'api',orderId:orderId};
+        var exitPrice=parseFloat(latest.avgPrice||0);
+        log('INFO','BingX API實際PnL: profit='+profit+' commission='+commission+' net='+pnlNet.toFixed(4)+'U exit='+exitPrice);
+        return{pnl:pnlNet,exitPrice:exitPrice,source:'api'};
       }
     }
   }catch(e){log('WARN','getActualPnlBX: '+e.message);}
