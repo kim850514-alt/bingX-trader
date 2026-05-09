@@ -11,10 +11,14 @@ const ENV={
 // 三層策略設定
 // ══════════════════════════════════
 const LAYERS={
-  scalp:{name:'短期',tf:'1m',sl:0.5,tp:0.8,lev:5,amt:1,threshold:2,maxHold:15},
-  swing:{name:'中期',tf:'5m',sl:1.0,tp:1.5,lev:5,amt:1,threshold:3,maxHold:120},
-  long: {name:'長期',tf:'1h',sl:2.0,tp:5.0,lev:5,amt:1,threshold:3,maxHold:1440}
+  scalp:{name:'短期',tf:'1m',sl:1.0,tp:1.5,lev:5,amt:1,threshold:2,maxHold:15},
+  swing:{name:'中期',tf:'5m',sl:2.0,tp:3.0,lev:5,amt:1,threshold:3,maxHold:120},
+  long: {name:'長期',tf:'1h',sl:3.0,tp:6.0,lev:5,amt:1,threshold:3,maxHold:1440}
 };
+
+// ✅ SL/TP 最小值限制（不可調動）
+const MIN_SL=1.0;  // 最小止損 1%
+const MIN_RR=1.5;  // 最小風報比 1:1.5
 
 let cfg={
   symbols:['SIREN-USDT','DOGE-USDT','XRP-USDT'],
@@ -37,6 +41,15 @@ function recordTrade(t){
   stats.trades.push(Object.assign({},t,{date:todayKey()}));
   if(stats.trades.length>500)stats.trades=stats.trades.slice(-500);
   saveStats();
+  learnFromTrade(t);
+  learnCycleCount++;
+  if(learnCycleCount>=3){
+    learnCycleCount=0;learningPause=true;
+    log('AI','=== 學習週期觸發！暫停交易 ===');
+    tg('[BingX 🧠] 學習週期開始\n已完成3筆，分析中...');
+    autoAdjust();
+    setTimeout(function(){learningPause=false;log('AI','=== 學習完成！恢復交易 ===');tg('[BingX 🧠] 學習完成！恢復交易');},3000);
+  }
 }
 
 let brain=loadBrain();
@@ -181,8 +194,75 @@ async function calcSignal(sym,layer){
 // 持倉記錄（三層獨立）
 // key 格式: sym_layer_L 或 sym_layer_S
 // ══════════════════════════════════
-var openTrades={};
-var usedOrderIds=new Set();
+var learnCycleCount=0,learningPause=false;
+
+function learnFromTrade(t){
+  brain.learnCount=(brain.learnCount||0)+1;
+  var symbol=t.symbol,pnl=t.pnl,holdMin=t.holdMin;
+  if(!brain.symbolPerf[symbol])brain.symbolPerf[symbol]={wins:0,losses:0,pnl:0,avgHold:0,count:0};
+  var sp=brain.symbolPerf[symbol];
+  if(pnl>0)sp.wins++;else sp.losses++;sp.pnl+=pnl;sp.count++;
+  sp.avgHold=((sp.avgHold*(sp.count-1))+holdMin)/sp.count;
+  var hr=String(hourTW());
+  if(!brain.hourPerf[hr])brain.hourPerf[hr]={wins:0,losses:0,pnl:0};
+  var hp=brain.hourPerf[hr];if(pnl>0)hp.wins++;else hp.losses++;hp.pnl+=pnl;
+  updateBestWorst();saveBrain();
+}
+
+function updateBestWorst(){
+  brain.bestHours=Object.keys(brain.hourPerf).filter(function(h){var p=brain.hourPerf[h];var t=p.wins+p.losses;return t>=3&&p.wins/t>=0.6;});
+  brain.worstHours=Object.keys(brain.hourPerf).filter(function(h){var p=brain.hourPerf[h];var t=p.wins+p.losses;return t>=3&&p.wins/t<0.35;});
+  brain.bestSymbols=Object.keys(brain.symbolPerf).filter(function(s){var p=brain.symbolPerf[s];var t=p.wins+p.losses;return t>=3&&p.wins/t>=0.55;});
+  brain.worstSymbols=Object.keys(brain.symbolPerf).filter(function(s){var p=brain.symbolPerf[s];var t=p.wins+p.losses;return t>=5&&p.wins/t<0.25&&p.pnl<-10;});
+}
+
+function autoAdjust(){
+  var recent=stats.trades.slice(-20);if(recent.length<3)return;
+  var wins=recent.filter(function(t){return t.pnl>0;});
+  var losses=recent.filter(function(t){return t.pnl<0;});
+  var wr=wins.length/recent.length;
+  var avgWin=wins.length?wins.reduce(function(s,t){return s+t.pnl;},0)/wins.length:0;
+  var avgLoss=losses.length?Math.abs(losses.reduce(function(s,t){return s+t.pnl;},0)/losses.length):0;
+  var rr=avgLoss>0?avgWin/avgLoss:1;
+  var changes=[];
+  var p=cfg.params;
+
+  // RSI 調整
+  if(wr<0.38&&p.oversold>20){var rv=p.oversold;p.oversold=Math.max(20,rv-3);changes.push('RSI超賣 '+rv+'->'+p.oversold);}
+  if(wr<0.38&&p.overbought<80){var rv2=p.overbought;p.overbought=Math.min(80,rv2+3);changes.push('RSI超買 '+rv2+'->'+p.overbought);}
+  if(wr>0.62&&p.oversold<45){var rv3=p.oversold;p.oversold=Math.min(45,rv3+2);changes.push('RSI超賣放寬 '+rv3+'->'+p.oversold);}
+  if(wr>0.62&&p.overbought>55){var rv4=p.overbought;p.overbought=Math.max(55,rv4-2);changes.push('RSI超買放寬 '+rv4+'->'+p.overbought);}
+
+  // BB 調整
+  if(wr<0.38&&p.bbStdDev<2.8){var bv=p.bbStdDev;p.bbStdDev=+(Math.min(2.8,bv+0.1)).toFixed(1);changes.push('BB寬度 '+bv+'->'+p.bbStdDev);}
+  if(wr>0.62&&p.bbStdDev>1.5){var bv2=p.bbStdDev;p.bbStdDev=+(Math.max(1.5,bv2-0.1)).toFixed(1);changes.push('BB收窄 '+bv2+'->'+p.bbStdDev);}
+
+  // 量能調整
+  if(wr<0.38&&p.volMultiple<1.8){var vv=p.volMultiple;p.volMultiple=+(Math.min(1.8,vv+0.1)).toFixed(1);changes.push('量能 '+vv+'->'+p.volMultiple);}
+  if(wr>0.62&&p.volMultiple>1.0){var vv2=p.volMultiple;p.volMultiple=+(Math.max(1.0,vv2-0.1)).toFixed(1);changes.push('量能降低 '+vv2+'->'+p.volMultiple);}
+
+  // 各層門檻調整
+  Object.keys(LAYERS).forEach(function(ln){
+    var lc=LAYERST[ln];
+    var layerTrades=recent.filter(function(t){return t.layer===ln;});
+    if(layerTrades.length>=3){
+      var lwr=layerTrades.filter(function(t){return t.pnl>0;}).length/layerTrades.length;
+      if(lwr<0.35&&lc.threshold<5){lc.threshold++;changes.push(lc.name+'門檻 ->'+lc.threshold);}
+      if(lwr>0.65&&lc.threshold>1){lc.threshold--;changes.push(lc.name+'門檻降 ->'+lc.threshold);}
+    }
+  });
+
+  if(changes.length){
+    brain.adjustHistory=brain.adjustHistory||[];
+    brain.adjustHistory.push({date:todayKey(),changes:changes,wr:(wr*100).toFixed(1),rr:rr.toFixed(2)});
+    if(brain.adjustHistory.length>100)brain.adjustHistory=brain.adjustHistory.slice(-100);
+    log('AI','自動調整: '+changes.join(' | '));
+    tg('[BingX 🧠 自動調整]\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'% RR:'+rr.toFixed(2));
+    saveBrain();
+  }
+}
+
+var LAYERST=LAYERS; // 讓 autoAdjust 可以修改門檻
 
 async function getActualPnlBX(symbol,openTime){
   try{
@@ -277,6 +357,7 @@ var botTimer=null,startTime=Date.now();
 
 async function tradingLoop(){
   if(!cfg.botRunning)return;
+  if(learningPause){log('INFO','學習暫停中');await checkPositions();return;}
   log('INFO','=== Loop '+nowTW()+' ===');
   try{
     var bal=await getBalance().catch(function(){return null;});
@@ -298,8 +379,11 @@ async function tradingLoop(){
           if(bal.available<layerCfg.amt){log('WARN',sym+' ['+layerName+'] 餘額不足');continue;}
 
           var cur=res.price;
-          var slD=cur*layerCfg.sl/100;
-          var tpD=cur*layerCfg.tp/100;
+          // ✅ 強制最小 SL 1%，最小 RR 1:1.5
+          var slPct=Math.max(MIN_SL,layerCfg.sl);
+          var tpPct=Math.max(slPct*MIN_RR,layerCfg.tp);
+          var slD=cur*slPct/100;
+          var tpD=cur*tpPct/100;
           var slP=+(res.signal==='BUY'?cur-slD:cur+slD).toFixed(4);
           var tpP=+(res.signal==='BUY'?cur+tpD:cur-tpD).toFixed(4);
 
@@ -408,6 +492,11 @@ function handleUpdate(update){
   if(cmd==='/log'){
     var logs=memLog.slice(-15).map(function(l){return '['+l.lv+'] '+l.msg.slice(0,80);}).join('\n');
     tg('[BingX] 日誌\n'+(logs||'無'),chatId);return;
+  }
+
+  if(cmd==='/brain'){
+    var lastAdj=brain.adjustHistory&&brain.adjustHistory.length?brain.adjustHistory[brain.adjustHistory.length-1]:{changes:['尚未調整']};
+    tg('[BingX] 🧠 學習狀態\n已學習:'+(brain.learnCount||0)+'次\n最佳時段:'+(brain.bestHours&&brain.bestHours.length?brain.bestHours.join(',')+'時':'學習中')+'\n最佳幣種:'+(brain.bestSymbols&&brain.bestSymbols.length?brain.bestSymbols.join(','):'學習中')+'\n調參次數:'+(brain.adjustHistory?brain.adjustHistory.length:0)+'\n最近:'+lastAdj.changes.join(', '),chatId);return;
   }
 
   if(cmd==='/short'){
