@@ -312,7 +312,42 @@ async function checkPositions(){
       }
 
       var estPnl=ps==='LONG'?(cur-t.entry)*t.qty*layerCfg.lev:(t.entry-cur)*t.qty*layerCfg.lev;
-      log('INFO','持倉 '+t.symbol+' ['+layer+'] 估算:'+(estPnl>=0?'+':'')+estPnl.toFixed(2)+'U Hold:'+holdMin+'min');
+      var estPnlPct=ps==='LONG'?(cur-t.entry)/t.entry*100:(t.entry-cur)/t.entry*100;
+      log('INFO','持倉 '+t.symbol+' ['+layer+'] 估算:'+(estPnl>=0?'+':'')+estPnl.toFixed(2)+'U ('+estPnlPct.toFixed(2)+'%) Hold:'+holdMin+'min');
+
+      // ✅ 移動止盈（Trailing Stop）
+      // 獲利達到 TP 的 50% 後啟動
+      var tpPct=Math.max(MIN_SL*MIN_RR,layerCfg.tp);
+      var trailActivatePct=tpPct*0.5; // 達到 TP 50% 啟動
+      var trailStopPct=0.5; // 回落 0.5% 觸發平倉
+
+      if(estPnlPct>=trailActivatePct){
+        // 更新最高獲利點
+        if(!t.maxProfitPct||estPnlPct>t.maxProfitPct){
+          t.maxProfitPct=estPnlPct;
+          t.trailActive=true;
+          if(!t.trailNotified){
+            t.trailNotified=true;
+            log('AI',t.symbol+' ['+layer+'] 移動止盈啟動！最高:'+estPnlPct.toFixed(2)+'%');
+            tg('[BingX] 🔒 移動止盈啟動\n'+t.symbol+' ['+layerCfg.name+']\n獲利:+'+estPnlPct.toFixed(2)+'%\n跟蹤中...');
+          }
+        }
+        // 從最高點回落超過 trailStopPct 觸發平倉
+        if(t.trailActive&&t.maxProfitPct-estPnlPct>=trailStopPct){
+          log('AI',t.symbol+' ['+layer+'] 移動止盈觸發！最高:'+t.maxProfitPct.toFixed(2)+'% 現在:'+estPnlPct.toFixed(2)+'%');
+          var ot=await closePos(t.symbol,ps,t.qty).catch(function(){return null;});
+          if(ot){
+            await new Promise(function(res2){setTimeout(res2,1500);});
+            var actual2=await getActualPnlBX(t.symbol,t.openTime);
+            var pnl2=actual2?actual2.pnl:estPnl;
+            var source2=actual2?'API':'估算';
+            recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl2,holdMin:holdMin,reason:'移動止盈',layer:layer});
+            delete openTrades[key];
+            tg('[BingX] 🔒 移動止盈平倉\n'+t.symbol+' ['+layerCfg.name+']\n最高:+'+t.maxProfitPct.toFixed(2)+'%\nPnL('+source2+'):'+(pnl2>=0?'✅ +':'❌ ')+pnl2.toFixed(4)+'U Hold:'+holdMin+'min');
+            continue;
+          }
+        }
+      }
 
       // K線反向訊號平倉
       if(holdMin>=5&&stillOpen){
@@ -323,13 +358,13 @@ async function checkPositions(){
             log('AI',t.symbol+' ['+layer+'] 反向訊號，平倉');
             var o=await closePos(t.symbol,ps,t.qty).catch(function(){return null;});
             if(o){
-              await new Promise(function(res2){setTimeout(res2,1500);});
-              var actual2=await getActualPnlBX(t.symbol,t.openTime);
-              var pnl2=actual2?actual2.pnl:estPnl;
-              var source2=actual2?'API':'估算';
-              recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl2,holdMin:holdMin,reason:'反向平倉',layer:layer});
+              await new Promise(function(res3){setTimeout(res3,1500);});
+              var actual3=await getActualPnlBX(t.symbol,t.openTime);
+              var pnl3=actual3?actual3.pnl:estPnl;
+              var source3=actual3?'API':'估算';
+              recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl3,holdMin:holdMin,reason:'反向平倉',layer:layer});
               delete openTrades[key];
-              tg('[BingX] 🔄 反向平倉\n'+t.symbol+' ['+layerCfg.name+']\nPnL('+source2+'):'+(pnl2>=0?'✅ +':'❌ ')+pnl2.toFixed(4)+'U Hold:'+holdMin+'min');
+              tg('[BingX] 🔄 反向平倉\n'+t.symbol+' ['+layerCfg.name+']\nPnL('+source3+'):'+(pnl3>=0?'✅ +':'❌ ')+pnl3.toFixed(4)+'U Hold:'+holdMin+'min');
               continue;
             }
           }
@@ -340,13 +375,13 @@ async function checkPositions(){
       if(holdMin>=layerCfg.maxHold){
         var o2=await closePos(t.symbol,ps,t.qty).catch(function(){return null;});
         if(o2){
-          await new Promise(function(res3){setTimeout(res3,1500);});
-          var actual3=await getActualPnlBX(t.symbol,t.openTime);
-          var pnl3=actual3?actual3.pnl:estPnl;
-          var source3=actual3?'API':'估算';
-          recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl3,holdMin:holdMin,reason:'超時平倉',layer:layer});
+          await new Promise(function(res4){setTimeout(res4,1500);});
+          var actual4=await getActualPnlBX(t.symbol,t.openTime);
+          var pnl4=actual4?actual4.pnl:estPnl;
+          var source4=actual4?'API':'估算';
+          recordTrade({symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl4,holdMin:holdMin,reason:'超時平倉',layer:layer});
           delete openTrades[key];
-          tg('[BingX] ⏰ 超時\n'+t.symbol+' ['+layerCfg.name+']\nPnL('+source3+'):'+(pnl3>=0?'✅ +':'❌ ')+pnl3.toFixed(4)+'U Hold:'+holdMin+'min');
+          tg('[BingX] ⏰ 超時\n'+t.symbol+' ['+layerCfg.name+']\nPnL('+source4+'):'+(pnl4>=0?'✅ +':'❌ ')+pnl4.toFixed(4)+'U Hold:'+holdMin+'min');
         }
       }
     }catch(e){log('ERROR','checkPos: '+e.message);}
