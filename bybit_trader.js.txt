@@ -1,1250 +1,744 @@
-"use strict";
-
-/*
-  Bybit V5 小幣撥平頭 / 平底策略機器人
-  檔名可用：bybit_trader.js.txt
-
-  功能：
-  - 直接抓 Bybit K 線，不靠 TradingView
-  - DOGE / SIREN / HYPE 等小幣掃描
-  - 平頭 / 平底 / 掃流動性策略
-  - 固定 RR 1:1.5，機器人不可自學修改
-  - 結構止損
-  - TP1 分倉出場
-  - TP1 後移動止損
-  - TP2 全出
-  - 可翻倉，但不加倍
-  - Bybit API 查持倉、未實現 PnL、已實現 PnL
-  - Telegram 通知
-  - 自學只能微調進場參數
-
-  需要環境變數：
-  BYBIT_API_KEY
-  BYBIT_SECRET_KEY
-  TELEGRAM_TOKEN
-  TELEGRAM_CHAT_ID
-  BYBIT_TESTNET=true / false
-  DRY_RUN=true / false
-*/
-
-try {
-  require("dotenv").config();
-} catch (_) {}
-
-const crypto = require("crypto");
-const https = require("https");
-const fs = require("fs");
-
-// =====================
-// 環境設定
-// =====================
-
-const ENV = {
-  BYBIT_API_KEY: process.env.BYBIT_API_KEY || "",
-  BYBIT_SECRET: process.env.BYBIT_SECRET_KEY || "",
-  TG_TOKEN: process.env.TELEGRAM_TOKEN || "",
-  TG_CHAT: process.env.TELEGRAM_CHAT_ID || "",
-  TESTNET: String(process.env.BYBIT_TESTNET || "true").toLowerCase() === "true",
-  DRY_RUN: String(process.env.DRY_RUN || "true").toLowerCase() === "true"
-};
-
-const BASE_URL = ENV.TESTNET
-  ? "https://api-testnet.bybit.com"
-  : "https://api.bybit.com";
-
-// =====================
-// 主要設定
-// =====================
-
-const cfg = {
-  category: "linear",
-  settleCoin: "USDT",
-
-  timeframe: "5",
-  pollSeconds: 15,
-  klineLimit: 120,
-
-  symbols: [
-    "DOGEUSDT",
-    "SIRENUSDT",
-    "HYPEUSDT"
-  ],
-
-  tradeAmountUSDT: 1,
-  leverage: 5,
-
-  fixedRR: 1.5,
-  allowLearningRR: false,
-
-  maxPositionsTotal: 3,
-  maxPositionsPerSymbol: 1,
-
-  cooldownMin: 20,
-
-  allowFlip: true,
-  maxFlipPerSymbolPerDay: 2,
-  flipCooldownMin: 30,
-  forbidMartingale: true,
-  flipSizeMultiplier: 1.0,
-
-  tp1R: 1.0,
-  tp1ClosePercent: 50,
-  tp2R: 1.5,
-
-  trailing: {
-    enabled: true,
-    activateAfterTP1: true,
-    trailDistanceR: 0.5,
-    trailStepR: 0.25,
-    breakEvenOffsetPercent: 0.02
-  },
-
-  params: {
-    flatLookback: 24,
-    flatTolerance: 0.0025,
-    minTouches: 2,
-    breakoutBuffer: 0.0012,
-    reclaimBars: 2,
-    volumeMultiple: 1.35,
-    maxCandleRangePercent: 3.5,
-    minVolumeUSDT: 30000
-  },
-
-  learning: {
-    enabled: true,
-    minTradesBeforeLearning: 20,
-    learnBatchSize: 10,
-    file: "bybit_learning_stats.json"
-  },
-
-  stateFile: "bybit_bot_state.json"
-};
-
-// =====================
-// 狀態資料
-// =====================
-
-let state = loadJSON(cfg.stateFile, {
-  trades: {},
-  cooldowns: {},
-  flipCount: {},
-  lastSignalBar: {},
-  equityLog: []
-});
-
-let stats = loadJSON(cfg.learning.file, {
-  trades: [],
-  params: cfg.params
-});
-
-cfg.params = Object.assign({}, cfg.params, stats.params || {});
-
-// =====================
-// 工具函數
-// =====================
-
-function nowMs() {
-  return Date.now();
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function loadJSON(path, fallback) {
-  try {
-    if (!fs.existsSync(path)) return fallback;
-    return JSON.parse(fs.readFileSync(path, "utf8"));
-  } catch (err) {
-    console.log(`[WARN] 讀取 ${path} 失敗：${err.message}`);
-    return fallback;
-  }
-}
-
-function saveJSON(path, data) {
-  try {
-    fs.writeFileSync(path, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.log(`[WARN] 儲存 ${path} 失敗：${err.message}`);
-  }
-}
-
-function roundToStep(value, step) {
-  const v = Number(value);
-  const s = Number(step);
-  if (!Number.isFinite(v) || !Number.isFinite(s) || s <= 0) return v;
-  return Math.floor(v / s) * s;
-}
-
-function decimalsFromStep(step) {
-  const s = String(step);
-  if (!s.includes(".")) return 0;
-  return s.split(".")[1].length;
-}
-
-function fmt(num, dp = 6) {
-  const n = Number(num);
-  if (!Number.isFinite(n)) return "0";
-  return n.toFixed(dp).replace(/\.?0+$/, "");
-}
-
-function sideOpposite(side) {
-  return side === "Buy" ? "Sell" : "Buy";
-}
-
-function getDayKey() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function avg(arr) {
-  if (!arr || arr.length === 0) return 0;
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
-}
-
-function clampNum(v, min, max) {
-  v = Number(v);
-  if (!Number.isFinite(v)) return min;
-  return Math.min(max, Math.max(min, v));
-}
-
-function clampInt(v, min, max) {
-  return Math.round(clampNum(v, min, max));
-}
-
-// =====================
-// HTTP
-// =====================
-
-function httpRequest({ method, url, headers = {}, body = "" }) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-
-    const req = https.request({
-      method,
-      hostname: u.hostname,
-      path: u.pathname + u.search,
-      headers
-    }, res => {
-      let data = "";
-
-      res.on("data", chunk => {
-        data += chunk;
-      });
-
-      res.on("end", () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (_) {
-          resolve(data);
-        }
-      });
-    });
-
-    req.on("error", reject);
-
-    if (body) req.write(body);
-    req.end();
-  });
-}
-
-// =====================
-// Telegram
-// =====================
-
-async function tg(text) {
-  console.log(text);
-
-  if (!ENV.TG_TOKEN || !ENV.TG_CHAT) return;
-
-  const body = JSON.stringify({
-    chat_id: ENV.TG_CHAT,
-    text
-  });
-
-  try {
-    await httpRequest({
-      method: "POST",
-      url: `https://api.telegram.org/bot${ENV.TG_TOKEN}/sendMessage`,
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body)
-      },
-      body
-    });
-  } catch (err) {
-    console.log(`[WARN] Telegram 發送失敗：${err.message}`);
-  }
-}
-
-// =====================
-// Bybit V5 API
-// =====================
-
-function signBybit(timestamp, apiKey, recvWindow, payload) {
-  const raw = `${timestamp}${apiKey}${recvWindow}${payload}`;
-  return crypto
-    .createHmac("sha256", ENV.BYBIT_SECRET)
-    .update(raw)
-    .digest("hex");
-}
-
-async function bybitPublic(method, path, query = {}) {
-  const qs = new URLSearchParams(query).toString();
-  const url = `${BASE_URL}${path}${qs ? "?" + qs : ""}`;
-
-  const res = await httpRequest({
-    method,
-    url,
-    headers: {
-      "Content-Type": "application/json"
-    }
-  });
-
-  if (!res || typeof res !== "object") {
-    throw new Error(`Bybit public 回傳不是 JSON：${String(res).slice(0, 120)}`);
-  }
-
-  if (res.retCode !== 0) {
-    throw new Error(`Bybit public error ${res.retCode}: ${res.retMsg}`);
-  }
-
-  return res;
-}
-
-async function bybitPrivate(method, path, data = {}) {
-  if (!ENV.BYBIT_API_KEY || !ENV.BYBIT_SECRET) {
-    throw new Error("缺少 BYBIT_API_KEY 或 BYBIT_SECRET_KEY");
-  }
-
-  const timestamp = String(Date.now());
-  const recvWindow = "5000";
-
-  let query = "";
-  let body = "";
-
-  if (method === "GET") {
-    query = new URLSearchParams(data).toString();
-  } else {
-    body = JSON.stringify(data);
-  }
-
-  const payload = method === "GET" ? query : body;
-  const signature = signBybit(timestamp, ENV.BYBIT_API_KEY, recvWindow, payload);
-
-  const url = `${BASE_URL}${path}${query ? "?" + query : ""}`;
-
-  const res = await httpRequest({
-    method,
-    url,
-    headers: {
-      "Content-Type": "application/json",
-      "X-BAPI-API-KEY": ENV.BYBIT_API_KEY,
-      "X-BAPI-SIGN": signature,
-      "X-BAPI-TIMESTAMP": timestamp,
-      "X-BAPI-RECV-WINDOW": recvWindow,
-      "X-BAPI-SIGN-TYPE": "2"
+"""
+撥平頭策略機器人 v4.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+進場邏輯：
+  偵測到信號 → Telegram 推播 [✅確認 / ❌跳過]
+  確認後：
+    第1批（50%）→ 市價立即進場
+    第2批（50%）→ 限價掛單（低於第1批成交價 0.5%）
+
+出場邏輯：
+  持倉均價達到 1R 獲利 → 自動市價平一半
+  剩餘一半 → 啟動固定距離移動止損（1.0%）
+
+止損：SL 固定在頂部上方 0.2%，開倉時設定
+
+指令：/start /status /pnl /balance /pause /resume /close
+幣種：DOGEUSDT（在 SYMBOLS_CONFIG 加入更多）
+交易所：Bybit USDT Perpetual (Unified Margin)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+import asyncio
+import logging
+import os
+import time
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+from pybit.unified_trading import HTTP
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+)
+
+# ══════════════════════════════════════════════════════
+#  ⚙️  設定區（填入你的 key 或用環境變數）
+# ══════════════════════════════════════════════════════
+BYBIT_API_KEY    = os.getenv("BYBIT_API_KEY",    "YOUR_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "YOUR_API_SECRET")
+TESTNET          = True   # ⚠️ 先跑 Testnet，確認後改 False
+
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "YOUR_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+
+# ── 幣種設定（之後加幣只需在此新增）────────────────────
+SYMBOLS_CONFIG: dict[str, dict] = {
+    "DOGEUSDT": {
+        "enabled":          True,
+        "interval":         "15",    # K線週期（分鐘）
+        "leverage":         5,
+        "order_usdt":       30,      # 每次信號總名義倉位 USDT
+        "lookback":         150,     # 回看K線根數
+        "tolerance":        0.002,   # 平頂容差 0.2%
+        "sl_buffer":        0.002,   # SL 高於頂部 0.2%
+        # ── 分批進場 ──────────────────────────────
+        "entry_market_pct": 0.5,     # 第1批市價佔比 50%
+        "entry_limit_pct":  0.5,     # 第2批限價佔比 50%
+        "entry_limit_offset": 0.005, # 限價低於市價成交價 0.5%
+        # ── 出場 ──────────────────────────────────
+        "half_tp_r":        1.0,     # 半倉止盈 = 1R
+        "trailing_pct":     0.010,   # 移動止損追蹤距離 1.0%（固定價格距離）
+        # ── 其他 ──────────────────────────────────
+        "signal_cooldown":  300,     # 同幣種信號冷卻秒數
+        "qty_decimals":     0,       # DOGE 數量為整數
     },
-    body
-  });
-
-  if (!res || typeof res !== "object") {
-    throw new Error(`Bybit private 回傳不是 JSON：${String(res).slice(0, 120)}`);
-  }
-
-  if (res.retCode !== 0) {
-    throw new Error(`Bybit private error ${res.retCode}: ${res.retMsg}`);
-  }
-
-  return res;
+    # ── 之後新增幣種範例（先 enabled:False）─────────
+    # "ETHUSDT": {
+    #     "enabled": False,
+    #     "interval": "15", "leverage": 5, "order_usdt": 50,
+    #     "lookback": 150, "tolerance": 0.0015, "sl_buffer": 0.002,
+    #     "entry_market_pct": 0.5, "entry_limit_pct": 0.5,
+    #     "entry_limit_offset": 0.005,
+    #     "half_tp_r": 1.0, "trailing_pct": 0.008,
+    #     "signal_cooldown": 300, "qty_decimals": 2,
+    # },
 }
 
-// =====================
-// Bybit 功能
-// =====================
+POLL_SEC = 20   # 主迴圈輪詢間隔（秒）
+# ══════════════════════════════════════════════════════
 
-async function getKlines(symbol, limit = cfg.klineLimit) {
-  const res = await bybitPublic("GET", "/v5/market/kline", {
-    category: cfg.category,
-    symbol,
-    interval: cfg.timeframe,
-    limit: String(limit)
-  });
 
-  const rows = res.result && Array.isArray(res.result.list)
-    ? res.result.list
-    : [];
+# ══════════════════════════════════════════════════════
+#  📋  日誌設定
+# ══════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("flat_top_v4.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger(__name__)
 
-  return rows.reverse().map(k => ({
-    time: Number(k[0]),
-    open: Number(k[1]),
-    high: Number(k[2]),
-    low: Number(k[3]),
-    close: Number(k[4]),
-    volume: Number(k[5]),
-    turnover: Number(k[6])
-  })).filter(c => Number.isFinite(c.close));
+
+# ══════════════════════════════════════════════════════
+#  📦  每個幣種的執行狀態
+# ══════════════════════════════════════════════════════
+@dataclass
+class SymbolState:
+    symbol:             str
+    cfg:                dict
+
+    # 信號等待確認
+    pending_signal:     Optional[dict] = None
+
+    # 倉位資訊
+    in_position:        bool  = False
+    market_entry_price: float = 0.0    # 第1批市價成交均價（估算）
+    limit_order_id:     str   = ""     # 第2批限價掛單 ID
+    limit_price:        float = 0.0    # 第2批限價
+    sl_price:           float = 0.0
+    half_tp_price:      float = 0.0    # 基於市價批次計算的 TP
+    half_exited:        bool  = False
+    trailing_active:    bool  = False
+
+    # 冷卻
+    last_signal_ts:     float = 0.0
+
+
+states: dict[str, SymbolState] = {
+    sym: SymbolState(symbol=sym, cfg=cfg)
+    for sym, cfg in SYMBOLS_CONFIG.items()
+    if cfg.get("enabled")
 }
 
-async function getInstrument(symbol) {
-  const res = await bybitPublic("GET", "/v5/market/instruments-info", {
-    category: cfg.category,
-    symbol
-  });
+bot_paused = False
+tg_app: Optional[Application] = None
 
-  const list = res.result && Array.isArray(res.result.list)
-    ? res.result.list
-    : [];
 
-  const item = list[0];
+# ══════════════════════════════════════════════════════
+#  🔌  Bybit API 封裝
+# ══════════════════════════════════════════════════════
+bybit = HTTP(
+    testnet=TESTNET,
+    api_key=BYBIT_API_KEY,
+    api_secret=BYBIT_API_SECRET,
+)
 
-  if (!item) {
-    throw new Error(`找不到交易對：${symbol}`);
-  }
 
-  return {
-    symbol,
-    qtyStep: Number(item.lotSizeFilter.qtyStep),
-    minOrderQty: Number(item.lotSizeFilter.minOrderQty),
-    tickSize: Number(item.priceFilter.tickSize)
-  };
-}
+def get_klines(symbol: str, interval: str, limit: int = 160) -> list[dict]:
+    resp = bybit.get_kline(
+        category="linear", symbol=symbol, interval=interval, limit=limit,
+    )
+    return [
+        {
+            "ts":    int(r[0]),
+            "open":  float(r[1]),
+            "high":  float(r[2]),
+            "low":   float(r[3]),
+            "close": float(r[4]),
+            "vol":   float(r[5]),
+        }
+        for r in resp["result"]["list"]
+    ]   # index 0 = 最新未收盤
 
-async function setLeverage(symbol) {
-  if (ENV.DRY_RUN) {
-    console.log(`[DRY_RUN] 略過設定槓桿 ${symbol} x${cfg.leverage}`);
-    return;
-  }
 
-  try {
-    await bybitPrivate("POST", "/v5/position/set-leverage", {
-      category: cfg.category,
-      symbol,
-      buyLeverage: String(cfg.leverage),
-      sellLeverage: String(cfg.leverage)
-    });
-  } catch (err) {
-    console.log(`[WARN] 設定槓桿 ${symbol} 失敗：${err.message}`);
-  }
-}
+def get_last_price(symbol: str) -> float:
+    resp = bybit.get_tickers(category="linear", symbol=symbol)
+    return float(resp["result"]["list"][0]["lastPrice"])
 
-async function placeMarketOrder({ symbol, side, qty, reduceOnly = false }) {
-  const payload = {
-    category: cfg.category,
-    symbol,
-    side,
-    orderType: "Market",
-    qty: String(qty),
-    reduceOnly,
-    positionIdx: 0
-  };
 
-  if (ENV.DRY_RUN) {
-    console.log("[DRY_RUN] 下單", payload);
+def get_open_position(symbol: str) -> Optional[dict]:
+    resp = bybit.get_positions(category="linear", symbol=symbol)
+    for p in resp["result"]["list"]:
+        if float(p.get("size", 0)) > 0:
+            return p
+    return None
+
+
+def get_closed_pnl(symbol: str, limit: int = 10) -> list:
+    resp = bybit.get_closed_pnl(category="linear", symbol=symbol, limit=limit)
+    return resp["result"]["list"]
+
+
+def get_wallet_usdt() -> dict:
+    resp = bybit.get_wallet_balance(accountType="UNIFIED")
+    for c in resp["result"]["list"][0]["coin"]:
+        if c["coin"] == "USDT":
+            return c
+    return {}
+
+
+def set_leverage(symbol: str, lev: int):
+    try:
+        bybit.set_leverage(
+            category="linear", symbol=symbol,
+            buyLeverage=str(lev), sellLeverage=str(lev),
+        )
+    except Exception as e:
+        log.debug(f"[{symbol}] 槓桿設定跳過: {e}")
+
+
+def fmt_qty(qty: float, decimals: int) -> str:
+    return str(int(qty)) if decimals == 0 else str(round(qty, decimals))
+
+
+def cancel_order(symbol: str, order_id: str):
+    if not order_id:
+        return
+    try:
+        bybit.cancel_order(category="linear", symbol=symbol, orderId=order_id)
+        log.info(f"[{symbol}] 取消限價單 {order_id}")
+    except Exception as e:
+        log.debug(f"[{symbol}] 取消訂單失敗（可能已成交）: {e}")
+
+
+def place_market_short(symbol: str, qty: str) -> tuple[str, float]:
+    """市價開空，回傳 (orderId, 估算成交價)"""
+    price = get_last_price(symbol)
+    resp = bybit.place_order(
+        category="linear", symbol=symbol,
+        side="Sell", orderType="Market",
+        qty=qty, timeInForce="IOC",
+        reduceOnly=False,
+    )
+    oid = resp["result"].get("orderId", "")
+    return oid, price
+
+
+def place_limit_short(symbol: str, qty: str, price: float) -> str:
+    """限價開空，回傳 orderId"""
+    resp = bybit.place_order(
+        category="linear", symbol=symbol,
+        side="Sell", orderType="Limit",
+        qty=qty, price=str(round(price, 6)),
+        timeInForce="GTC",
+        reduceOnly=False,
+    )
+    return resp["result"].get("orderId", "")
+
+
+def place_market_close(symbol: str, qty: str) -> str:
+    """市價平空（reduceOnly）"""
+    resp = bybit.place_order(
+        category="linear", symbol=symbol,
+        side="Buy", orderType="Market",
+        qty=qty, timeInForce="IOC",
+        reduceOnly=True,
+    )
+    return resp["result"].get("orderId", "")
+
+
+def set_sl_price(symbol: str, sl: float):
+    try:
+        bybit.set_trading_stop(
+            category="linear", symbol=symbol,
+            stopLoss=str(round(sl, 6)),
+            slTriggerBy="MarkPrice",
+            positionIdx=0,
+        )
+        log.info(f"[{symbol}] SL 設定: {sl:.6f}")
+    except Exception as e:
+        log.error(f"[{symbol}] SL 設定失敗: {e}")
+
+
+def activate_trailing_stop(symbol: str, trail_dist: float):
+    """
+    啟動 Bybit 原生 Trailing Stop
+    trail_dist = 固定追蹤距離（價格單位）
+    平台端執行，VPS 斷線也有效
+    """
+    try:
+        bybit.set_trading_stop(
+            category="linear", symbol=symbol,
+            trailingStop=str(round(trail_dist, 6)),
+            positionIdx=0,
+        )
+        log.info(f"[{symbol}] Trailing Stop 啟動 dist={trail_dist:.6f}")
+    except Exception as e:
+        log.error(f"[{symbol}] Trailing Stop 失敗: {e}")
+
+
+def check_limit_filled(symbol: str, order_id: str) -> bool:
+    """查詢限價單是否已成交"""
+    if not order_id:
+        return False
+    try:
+        resp = bybit.get_order_history(
+            category="linear", symbol=symbol, orderId=order_id, limit=1,
+        )
+        orders = resp["result"]["list"]
+        if orders and orders[0]["orderStatus"] == "Filled":
+            return True
+    except Exception as e:
+        log.debug(f"[{symbol}] 查詢限價單狀態失敗: {e}")
+    return False
+
+
+# ══════════════════════════════════════════════════════
+#  📊  撥平頭偵測
+# ══════════════════════════════════════════════════════
+def detect_flat_top(candles: list[dict], cfg: dict) -> Optional[dict]:
+    """
+    回看 lookback 根已收盤K線（排除 index 0 未收盤）：
+    1. 最高 high 為頂部基準 (peak)
+    2. ≥2 根K線的 high 落在容差內 → 確認平頂
+    3. 最新收盤 < peak → 尚未突破
+    回傳 signal dict 或 None
+    """
+    lookback = cfg["lookback"]
+    tol      = cfg["tolerance"]
+    sl_buf   = cfg["sl_buffer"]
+
+    closed = candles[1 : lookback + 1]
+    if len(closed) < 3:
+        return None
+
+    highs = [c["high"] for c in closed]
+    peak  = max(highs)
+    lb    = peak * (1 - tol)
+    ub    = peak * (1 + tol)
+
+    flat_count = sum(1 for h in highs if lb <= h <= ub)
+    if flat_count < 2:
+        return None
+
+    latest_close = closed[0]["close"]
+    if latest_close >= peak:
+        return None
+
+    sl   = round(peak * (1 + sl_buf), 6)
+    risk = sl - latest_close   # 1R = 這個距離
+    if risk <= 0:
+        return None
+
     return {
-      retCode: 0,
-      retMsg: "DRY_RUN",
-      result: {
-        orderId: `DRY-${Date.now()}`
-      }
-    };
-  }
-
-  return bybitPrivate("POST", "/v5/order/create", payload);
-}
-
-async function setPositionStopLoss({ symbol, stopLoss }) {
-  const payload = {
-    category: cfg.category,
-    symbol,
-    stopLoss: String(stopLoss),
-    slTriggerBy: "MarkPrice",
-    positionIdx: 0
-  };
-
-  if (ENV.DRY_RUN) {
-    console.log("[DRY_RUN] 設定保護止損", payload);
-    return {
-      retCode: 0,
-      retMsg: "DRY_RUN"
-    };
-  }
-
-  return bybitPrivate("POST", "/v5/position/trading-stop", payload);
-}
-
-// 修正版：linear 查全部持倉時必須帶 settleCoin
-async function getPositions(symbol) {
-  const data = {
-    category: cfg.category
-  };
-
-  if (symbol) {
-    data.symbol = symbol;
-  } else {
-    data.settleCoin = cfg.settleCoin;
-  }
-
-  const res = await bybitPrivate("GET", "/v5/position/list", data);
-
-  if (!res || res.retCode !== 0) {
-    console.log("[PnL] position/list 回傳異常：", JSON.stringify(res));
-    return [];
-  }
-
-  if (!res.result || !Array.isArray(res.result.list)) {
-    console.log("[PnL] position/list 無 result.list：", JSON.stringify(res));
-    return [];
-  }
-
-  return res.result.list;
-}
-
-// 修正版：closed-pnl 加 result.list 保護
-async function getClosedPnl(symbol, limit = 20) {
-  const data = {
-    category: cfg.category,
-    limit: String(limit)
-  };
-
-  if (symbol) {
-    data.symbol = symbol;
-  }
-
-  const res = await bybitPrivate("GET", "/v5/position/closed-pnl", data);
-
-  if (!res || res.retCode !== 0) {
-    console.log("[PnL] closed-pnl 回傳異常：", JSON.stringify(res));
-    return [];
-  }
-
-  if (!res.result || !Array.isArray(res.result.list)) {
-    console.log("[PnL] closed-pnl 無 result.list：", JSON.stringify(res));
-    return [];
-  }
-
-  return res.result.list;
-}
-
-// =====================
-// 策略：平頭 / 平底 / 掃流動性
-// =====================
-
-function detectSignal(symbol, candles) {
-  const p = cfg.params;
-
-  if (!Array.isArray(candles) || candles.length < p.flatLookback + 10) {
-    return null;
-  }
-
-  // 使用最後一根已收 K，避免未收 K 亂跳
-  const c = candles[candles.length - 2];
-
-  const start = candles.length - 2 - p.flatLookback;
-  const end = candles.length - 2;
-  const prev = candles.slice(start, end);
-
-  if (prev.length < p.flatLookback * 0.8) {
-    return null;
-  }
-
-  const highs = prev.map(x => x.high);
-  const lows = prev.map(x => x.low);
-  const volumes = prev.map(x => x.volume);
-
-  const zoneHigh = Math.max(...highs);
-  const zoneLow = Math.min(...lows);
-
-  const highTouches = prev.filter(x => {
-    return Math.abs(x.high - zoneHigh) / zoneHigh <= p.flatTolerance;
-  }).length;
-
-  const lowTouches = prev.filter(x => {
-    return Math.abs(x.low - zoneLow) / zoneLow <= p.flatTolerance;
-  }).length;
-
-  const avgVol = avg(volumes);
-  const volumeOk = avgVol > 0 && c.volume >= avgVol * p.volumeMultiple;
-
-  const candleRangePercent = ((c.high - c.low) / c.open) * 100;
-  const candleRangeOk = candleRangePercent <= p.maxCandleRangePercent;
-
-  const turnover = Number(c.turnover || c.volume * c.close || 0);
-  const turnoverOk = turnover >= p.minVolumeUSDT;
-
-  const commonOk = volumeOk && candleRangeOk && turnoverOk;
-
-  if (!commonOk) {
-    return null;
-  }
-
-  // 平頭掃高點後收回：做空
-  const flatTopOk = highTouches >= p.minTouches;
-  const sweptHigh = c.high > zoneHigh * (1 + p.breakoutBuffer);
-  const reclaimedBelow = c.close < zoneHigh;
-
-  if (flatTopOk && sweptHigh && reclaimedBelow) {
-    const entry = c.close;
-    const sl = c.high * (1 + p.flatTolerance);
-    const risk = sl - entry;
-
-    if (risk > 0) {
-      return {
-        symbol,
-        side: "Sell",
-        type: "FLAT_TOP_SHORT",
-        entry,
-        sl,
-        risk,
-        tp1: entry - risk * cfg.tp1R,
-        tp2: entry - risk * cfg.fixedRR,
-        zoneHigh,
-        zoneLow,
-        reason: `平頭掃高點收回，高點觸碰:${highTouches}，量能:${fmt(c.volume / avgVol, 2)}x`
-      };
-    }
-  }
-
-  // 平底掃低點後拉回：做多
-  const flatBottomOk = lowTouches >= p.minTouches;
-  const sweptLow = c.low < zoneLow * (1 - p.breakoutBuffer);
-  const reclaimedAbove = c.close > zoneLow;
-
-  if (flatBottomOk && sweptLow && reclaimedAbove) {
-    const entry = c.close;
-    const sl = c.low * (1 - p.flatTolerance);
-    const risk = entry - sl;
-
-    if (risk > 0) {
-      return {
-        symbol,
-        side: "Buy",
-        type: "FLAT_BOTTOM_LONG",
-        entry,
-        sl,
-        risk,
-        tp1: entry + risk * cfg.tp1R,
-        tp2: entry + risk * cfg.fixedRR,
-        zoneHigh,
-        zoneLow,
-        reason: `平底掃低點拉回，低點觸碰:${lowTouches}，量能:${fmt(c.volume / avgVol, 2)}x`
-      };
-    }
-  }
-
-  return null;
-}
-
-// =====================
-// 倉位管理
-// =====================
-
-async function calcQty(symbol, price) {
-  const ins = await getInstrument(symbol);
-  const notional = cfg.tradeAmountUSDT * cfg.leverage;
-
-  let qty = notional / price;
-  qty = roundToStep(qty, ins.qtyStep);
-
-  const dp = decimalsFromStep(ins.qtyStep);
-  qty = Number(qty.toFixed(dp));
-
-  if (!Number.isFinite(qty) || qty <= 0) {
-    throw new Error(`${symbol} 數量計算失敗 qty=${qty}`);
-  }
-
-  if (qty < ins.minOrderQty) {
-    throw new Error(`${symbol} 下單數量 ${qty} 小於最小數量 ${ins.minOrderQty}`);
-  }
-
-  return {
-    qty,
-    qtyStep: ins.qtyStep,
-    minOrderQty: ins.minOrderQty
-  };
-}
-
-function inCooldown(symbol) {
-  const until = state.cooldowns[symbol] || 0;
-  return Date.now() < until;
-}
-
-function setCooldown(symbol, min) {
-  state.cooldowns[symbol] = Date.now() + min * 60 * 1000;
-}
-
-function getOpenTrade(symbol) {
-  return state.trades[symbol] || null;
-}
-
-function countOpenTrades() {
-  return Object.values(state.trades).filter(Boolean).length;
-}
-
-function canFlip(symbol) {
-  const day = getDayKey();
-  const key = `${day}:${symbol}`;
-  const count = state.flipCount[key] || 0;
-  return count < cfg.maxFlipPerSymbolPerDay;
-}
-
-function recordFlip(symbol) {
-  const day = getDayKey();
-  const key = `${day}:${symbol}`;
-  state.flipCount[key] = (state.flipCount[key] || 0) + 1;
-}
-
-function reached(side, price, target) {
-  return side === "Buy" ? price >= target : price <= target;
-}
-
-function stopReached(side, price, stop) {
-  return side === "Buy" ? price <= stop : price >= stop;
-}
-
-function calcBreakEvenStop(trade) {
-  const offset = cfg.trailing.breakEvenOffsetPercent / 100;
-
-  if (trade.side === "Buy") {
-    return trade.entry * (1 + offset);
-  }
-
-  return trade.entry * (1 - offset);
-}
-
-function updateTrailing(trade, price) {
-  if (!cfg.trailing.enabled || !trade.tp1Done) return trade;
-
-  const dist = trade.risk * cfg.trailing.trailDistanceR;
-  const step = trade.risk * cfg.trailing.trailStepR;
-
-  if (trade.side === "Buy") {
-    if (price - trade.lastTrailRef >= step) {
-      const newStop = price - dist;
-
-      if (newStop > trade.trailingStop) {
-        trade.trailingStop = newStop;
-        trade.lastTrailRef = price;
-      }
-    }
-  } else {
-    if (trade.lastTrailRef - price >= step) {
-      const newStop = price + dist;
-
-      if (newStop < trade.trailingStop) {
-        trade.trailingStop = newStop;
-        trade.lastTrailRef = price;
-      }
-    }
-  }
-
-  return trade;
-}
-
-async function openTrade(signal, isFlip = false, ignoreCooldown = false) {
-  const symbol = signal.symbol;
-
-  if (countOpenTrades() >= cfg.maxPositionsTotal) {
-    console.log(`[SKIP] 持倉總數已滿`);
-    return;
-  }
-
-  if (getOpenTrade(symbol)) {
-    console.log(`[SKIP] ${symbol} 本地已有持倉`);
-    return;
-  }
-
-  if (!ignoreCooldown && inCooldown(symbol)) {
-    console.log(`[SKIP] ${symbol} 冷卻中`);
-    return;
-  }
-
-  await setLeverage(symbol);
-
-  const q = await calcQty(symbol, signal.entry);
-  const qty = q.qty;
-
-  let qtyTp1 = roundToStep(qty * (cfg.tp1ClosePercent / 100), q.qtyStep);
-  const dp = decimalsFromStep(q.qtyStep);
-  qtyTp1 = Number(qtyTp1.toFixed(dp));
-
-  if (qtyTp1 <= 0 || qtyTp1 >= qty) {
-    qtyTp1 = qty;
-  }
-
-  const qtyRemain = Number((qty - qtyTp1).toFixed(dp));
-
-  await placeMarketOrder({
-    symbol,
-    side: signal.side,
-    qty,
-    reduceOnly: false
-  });
-
-  await setPositionStopLoss({
-    symbol,
-    stopLoss: signal.sl
-  });
-
-  const trade = {
-    symbol,
-    side: signal.side,
-    entry: signal.entry,
-    sl: signal.sl,
-    originalSl: signal.sl,
-    risk: signal.risk,
-    tp1: signal.tp1,
-    tp2: signal.tp2,
-    qty,
-    qtyTp1,
-    qtyRemain,
-    tp1Done: false,
-    trailingActive: false,
-    trailingStop: signal.sl,
-    lastTrailRef: signal.entry,
-    openedAt: Date.now(),
-    reason: signal.reason,
-    type: signal.type,
-    isFlip
-  };
-
-  state.trades[symbol] = trade;
-  setCooldown(symbol, cfg.cooldownMin);
-  saveJSON(cfg.stateFile, state);
-
-  await tg(
-`✅ Bybit 開倉
-幣種：${symbol}
-方向：${signal.side === "Buy" ? "做多" : "做空"}
-進場：${fmt(signal.entry)}
-SL：${fmt(signal.sl)}
-TP1：${fmt(signal.tp1)}
-TP2：${fmt(signal.tp2)}
-數量：${qty}
-TP1出場數量：${qtyTp1}
-剩餘數量：${qtyRemain}
-RR：1:${cfg.fixedRR}
-原因：${signal.reason}
-翻倉：${isFlip ? "是" : "否"}
-模式：${ENV.DRY_RUN ? "DRY_RUN 模擬" : "正式下單"}`
-  );
-}
-
-async function closeTrade(symbol, reason, qtyOverride = null, keepCooldown = true) {
-  const trade = getOpenTrade(symbol);
-  if (!trade) return;
-
-  const closeSide = sideOpposite(trade.side);
-  const qty = qtyOverride || trade.qtyRemain || trade.qty;
-
-  if (!qty || qty <= 0) {
-    delete state.trades[symbol];
-    saveJSON(cfg.stateFile, state);
-    return;
-  }
-
-  await placeMarketOrder({
-    symbol,
-    side: closeSide,
-    qty,
-    reduceOnly: true
-  });
-
-  await tg(
-`🔚 Bybit 出場
-幣種：${symbol}
-原方向：${trade.side === "Buy" ? "做多" : "做空"}
-數量：${qty}
-原因：${reason}
-模式：${ENV.DRY_RUN ? "DRY_RUN 模擬" : "正式下單"}`
-  );
-
-  delete state.trades[symbol];
-
-  if (keepCooldown) {
-    setCooldown(symbol, cfg.cooldownMin);
-  }
-
-  saveJSON(cfg.stateFile, state);
-}
-
-async function closePartialTP1(trade) {
-  const symbol = trade.symbol;
-
-  if (!trade.qtyTp1 || trade.qtyTp1 <= 0) {
-    trade.tp1Done = true;
-    trade.trailingActive = true;
-    trade.trailingStop = calcBreakEvenStop(trade);
-    trade.lastTrailRef = trade.tp1;
-    state.trades[symbol] = trade;
-    saveJSON(cfg.stateFile, state);
-    return;
-  }
-
-  const closeSide = sideOpposite(trade.side);
-
-  await placeMarketOrder({
-    symbol,
-    side: closeSide,
-    qty: trade.qtyTp1,
-    reduceOnly: true
-  });
-
-  trade.tp1Done = true;
-  trade.trailingActive = true;
-  trade.trailingStop = calcBreakEvenStop(trade);
-  trade.lastTrailRef = trade.tp1;
-
-  state.trades[symbol] = trade;
-  saveJSON(cfg.stateFile, state);
-
-  await setPositionStopLoss({
-    symbol,
-    stopLoss: trade.trailingStop
-  });
-
-  await tg(
-`🟡 TP1 分倉出場
-幣種：${symbol}
-方向：${trade.side === "Buy" ? "做多" : "做空"}
-TP1：${fmt(trade.tp1)}
-已出：${trade.qtyTp1}
-剩餘：${trade.qtyRemain}
-止損移到：${fmt(trade.trailingStop)}
-移動止損：已啟動`
-  );
-}
-
-async function manageTrade(symbol, candles) {
-  const trade = getOpenTrade(symbol);
-  if (!trade) return;
-
-  const last = candles[candles.length - 1];
-  const price = last.close;
-
-  updateTrailing(trade, price);
-
-  if (!trade.tp1Done && reached(trade.side, price, trade.tp1)) {
-    await closePartialTP1(trade);
-    return;
-  }
-
-  if (trade.tp1Done && reached(trade.side, price, trade.tp2)) {
-    await closeTrade(symbol, "TP2 全出", trade.qtyRemain);
-    recordTradeResult(trade, "WIN_TP2");
-    return;
-  }
-
-  const activeStop = trade.tp1Done ? trade.trailingStop : trade.sl;
-
-  if (stopReached(trade.side, price, activeStop)) {
-    await closeTrade(
-      symbol,
-      trade.tp1Done ? "移動止損出場" : "原始止損出場",
-      trade.tp1Done ? trade.qtyRemain : trade.qty
-    );
-
-    recordTradeResult(trade, trade.tp1Done ? "WIN_OR_BE_TRAIL" : "LOSS_SL");
-    return;
-  }
-
-  state.trades[symbol] = trade;
-  saveJSON(cfg.stateFile, state);
-}
-
-// =====================
-// 翻倉
-// =====================
-
-function isOppositeSignal(trade, signal) {
-  if (!trade || !signal) return false;
-  return trade.side !== signal.side;
-}
-
-async function handleFlip(symbol, signal) {
-  const trade = getOpenTrade(symbol);
-
-  if (!trade) return false;
-  if (!cfg.allowFlip) return false;
-  if (!isOppositeSignal(trade, signal)) return false;
-
-  if (!canFlip(symbol)) {
-    console.log(`[SKIP] ${symbol} 今日翻倉次數已滿`);
-    return false;
-  }
-
-  await closeTrade(symbol, "反向結構成立，先平倉準備翻倉", trade.qtyRemain || trade.qty, false);
-
-  recordFlip(symbol);
-  recordTradeResult(trade, "FLIP_CLOSE");
-
-  await sleep(1500);
-
-  await openTrade(signal, true, true);
-
-  setCooldown(symbol, cfg.flipCooldownMin);
-  saveJSON(cfg.stateFile, state);
-
-  return true;
-}
-
-// =====================
-// PnL 查詢
-// =====================
-
-async function reportPnl() {
-  try {
-    const positions = await getPositions();
-
-    let text = "📊 Bybit PnL 狀態\n";
-
-    const activePositions = positions.filter(p => Number(p.size || 0) > 0);
-
-    if (activePositions.length === 0) {
-      text += "\n目前沒有交易所持倉\n";
-    } else {
-      for (const p of activePositions) {
-        text += `
-幣種：${p.symbol}
-方向：${p.side}
-數量：${p.size}
-均價：${p.avgPrice}
-標記價：${p.markPrice}
-未實現PnL：${p.unrealisedPnl}
-當前已實現PnL：${p.curRealisedPnl}
-累計已實現PnL：${p.cumRealisedPnl}
-倉位價值：${p.positionValue}
-`;
-      }
+        "peak":     peak,
+        "entry":    latest_close,   # 參考進場價
+        "sl":       sl,
+        "risk":     risk,
+        "half_tp":  round(latest_close - risk * cfg["half_tp_r"], 6),
     }
 
-    text += "\n本地追蹤持倉：";
 
-    const localTrades = Object.values(state.trades).filter(Boolean);
+# ══════════════════════════════════════════════════════
+#  📡  Telegram 工具
+# ══════════════════════════════════════════════════════
+async def _send_async(text: str, reply_markup=None):
+    if not tg_app:
+        return
+    try:
+        await tg_app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+    except Exception as e:
+        log.error(f"Telegram 發送失敗: {e}")
 
-    if (localTrades.length === 0) {
-      text += "\n無";
-    } else {
-      for (const t of localTrades) {
-        text += `
-${t.symbol} ${t.side === "Buy" ? "做多" : "做空"}
-Entry：${fmt(t.entry)}
-SL：${fmt(t.tp1Done ? t.trailingStop : t.sl)}
-TP1：${fmt(t.tp1)}
-TP2：${fmt(t.tp2)}
-TP1完成：${t.tp1Done ? "是" : "否"}`;
-      }
-    }
 
-    for (const symbol of cfg.symbols) {
-      try {
-        const closed = await getClosedPnl(symbol, 5);
-        const sum = closed.reduce((acc, x) => acc + Number(x.closedPnl || 0), 0);
-        text += `\n${symbol} 最近已實現PnL：${fmt(sum, 4)} USDT`;
-      } catch (err) {
-        text += `\n${symbol} 已實現PnL查詢失敗：${err.message}`;
-      }
-    }
+def tg_notify(text: str, reply_markup=None):
+    """從同步執行緒安全呼叫 async send"""
+    if tg_app and tg_app.running:
+        asyncio.run_coroutine_threadsafe(
+            _send_async(text, reply_markup), tg_app.loop,
+        )
 
-    console.log(text);
-    await tg(text);
 
-  } catch (err) {
-    console.log(`[WARN] PnL 查詢失敗：${err.message}`);
-    await tg(`⚠️ PnL 查詢失敗：${err.message}`);
-  }
-}
+def confirm_keyboard(symbol: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ 確認做空 {symbol}", callback_data=f"confirm:{symbol}"),
+        InlineKeyboardButton("❌ 跳過",               callback_data=f"skip:{symbol}"),
+    ]])
 
-// =====================
-// 啟動同步持倉
-// =====================
 
-async function syncExchangePositionsOnStart() {
-  try {
-    if (ENV.DRY_RUN) {
-      console.log("[SYNC] DRY_RUN 模式略過交易所持倉同步");
-      return;
-    }
+# ══════════════════════════════════════════════════════
+#  🤖  Telegram 指令
+# ══════════════════════════════════════════════════════
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 <b>撥平頭機器人 v4.0</b>\n\n"
+        "<b>進場：</b>\n"
+        "  偵測信號 → 推播通知 → 你確認\n"
+        "  ✅ 第1批 50% 市價進場\n"
+        "  ✅ 第2批 50% 限價掛在 -0.5%\n\n"
+        "<b>出場：</b>\n"
+        "  達到 1R → 自動平一半\n"
+        "  剩餘 → 移動止損 1.0% 追蹤\n\n"
+        "<b>指令：</b>\n"
+        "  /status  — 持倉狀態\n"
+        "  /pnl     — 近期損益\n"
+        "  /balance — 帳戶餘額\n"
+        "  /pause   — 暫停偵測\n"
+        "  /resume  — 恢復偵測\n"
+        "  /close DOGEUSDT — 市價全平",
+        parse_mode="HTML",
+    )
 
-    const positions = await getPositions();
-    const active = positions.filter(p => Number(p.size || 0) > 0);
 
-    if (active.length === 0) {
-      console.log("[SYNC] 交易所目前無持倉");
-      return;
-    }
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    lines = ["📊 <b>持倉狀態</b>\n"]
+    for sym, st in states.items():
+        price = get_last_price(sym)
+        pos   = get_open_position(sym)
 
-    await tg(`🔄 啟動同步：交易所目前有 ${active.length} 個持倉。請確認本地 state 是否一致。`);
+        if pos and st.in_position:
+            avg   = float(pos["avgPrice"])
+            size  = float(pos["size"])
+            upnl  = float(pos.get("unrealisedPnl", 0))
+            lines.append(
+                f"<b>{sym}</b> 🔴 持倉中\n"
+                f"  均價: {avg:.6f}  現價: {price:.6f}\n"
+                f"  數量: {size}  未實現: {upnl:+.2f} USDT\n"
+                f"  SL: {st.sl_price:.6f}\n"
+                f"  半倉TP(1R): {st.half_tp_price:.6f}  "
+                f"{'✅已出' if st.half_exited else '❌未出'}\n"
+                f"  移動止損: {'✅啟動' if st.trailing_active else '❌未啟動'}\n"
+                f"  限價單: {st.limit_order_id or '無'} @ {st.limit_price:.6f}\n"
+            )
+        elif st.pending_signal:
+            sig = st.pending_signal
+            lines.append(
+                f"<b>{sym}</b> ⏳ 等待你確認\n"
+                f"  頂部: {sig['peak']:.6f}  SL: {sig['sl']:.6f}\n"
+                f"  半倉TP: {sig['half_tp']:.6f}\n"
+            )
+        else:
+            lines.append(f"<b>{sym}</b> 無倉位 | 現價: {price:.6f}\n")
 
-    for (const p of active) {
-      console.log("[SYNC POSITION]", {
-        symbol: p.symbol,
-        side: p.side,
-        size: p.size,
-        avgPrice: p.avgPrice,
-        unrealisedPnl: p.unrealisedPnl
-      });
-    }
+    lines.append(f"\n機器人: {'⏸️ 已暫停' if bot_paused else '✅ 運行中'}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-  } catch (err) {
-    console.log(`[WARN] 啟動持倉同步失敗：${err.message}`);
-    await tg(`⚠️ 啟動持倉同步失敗：${err.message}`);
-  }
-}
 
-// =====================
-// 自學模組：只能調參數，不能動 RR
-// =====================
+async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    lines = ["💰 <b>近期已實現損益</b>\n"]
+    for sym in states:
+        records = get_closed_pnl(sym, limit=5)
+        if not records:
+            lines.append(f"<b>{sym}</b>: 無紀錄\n")
+            continue
+        total = sum(float(r["closedPnl"]) for r in records)
+        lines.append(f"<b>{sym}</b>  近5筆合計: <b>{total:+.2f} USDT</b>")
+        for r in records:
+            t   = datetime.fromtimestamp(int(r["updatedTime"]) / 1000).strftime("%m/%d %H:%M")
+            pnl = float(r["closedPnl"])
+            lines.append(f"  {'🟢' if pnl >= 0 else '🔴'} {t}  {pnl:+.4f} USDT")
+        lines.append("")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-function recordTradeResult(trade, result) {
-  stats.trades.push({
-    time: Date.now(),
-    symbol: trade.symbol,
-    side: trade.side,
-    result,
-    paramsUsed: Object.assign({}, cfg.params),
-    fixedRR: cfg.fixedRR
-  });
 
-  saveJSON(cfg.learning.file, stats);
+async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    w = get_wallet_usdt()
+    await update.message.reply_text(
+        f"💳 <b>帳戶 USDT</b>\n\n"
+        f"總權益:    {float(w.get('equity', 0)):.2f}\n"
+        f"可用餘額:  {float(w.get('availableToWithdraw', 0)):.2f}\n"
+        f"未實現PnL: {float(w.get('unrealisedPnl', 0)):+.2f}",
+        parse_mode="HTML",
+    )
 
-  if (cfg.learning.enabled) {
-    maybeLearn();
-  }
-}
 
-function maybeLearn() {
-  const trades = stats.trades || [];
+async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global bot_paused
+    bot_paused = True
+    await update.message.reply_text("⏸️ 已暫停偵測新信號，現有倉位繼續管理。")
 
-  if (trades.length < cfg.learning.minTradesBeforeLearning) return;
-  if (trades.length % cfg.learning.learnBatchSize !== 0) return;
 
-  const recent = trades.slice(-cfg.learning.learnBatchSize);
-  const wins = recent.filter(t => String(t.result).includes("WIN")).length;
-  const winRate = wins / recent.length;
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global bot_paused
+    bot_paused = False
+    await update.message.reply_text("▶️ 已恢復信號偵測。")
 
-  const next = Object.assign({}, cfg.params);
 
-  if (winRate < 0.45) {
-    next.volumeMultiple = Math.min(2.0, Number((next.volumeMultiple + 0.05).toFixed(2)));
-    next.flatTolerance = Math.max(0.0015, Number((next.flatTolerance - 0.0001).toFixed(4)));
-  } else if (winRate > 0.6) {
-    next.volumeMultiple = Math.max(1.1, Number((next.volumeMultiple - 0.03).toFixed(2)));
-    next.flatTolerance = Math.min(0.0035, Number((next.flatTolerance + 0.0001).toFixed(4)));
-  }
+async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = ctx.args
+    if not args:
+        await update.message.reply_text("用法: /close DOGEUSDT")
+        return
+    sym = args[0].upper()
+    if sym not in states:
+        await update.message.reply_text(f"❌ 不認識的幣種: {sym}")
+        return
+    pos = get_open_position(sym)
+    if not pos:
+        await update.message.reply_text(f"{sym} 目前無倉位。")
+        return
+    st = states[sym]
+    # 先取消限價掛單
+    cancel_order(sym, st.limit_order_id)
+    # 市價全平
+    size = pos["size"]
+    bybit.place_order(
+        category="linear", symbol=sym,
+        side="Buy", orderType="Market",
+        qty=size, reduceOnly=True, timeInForce="IOC",
+    )
+    _reset_state(st)
+    await update.message.reply_text(f"✅ {sym} 已市價全平 {size} 口")
+    tg_notify(f"🔴 <b>{sym}</b> 手動全平 {size} 口")
 
-  stats.params = sanitizeLearnedParams(next);
-  cfg.params = Object.assign({}, stats.params);
 
-  saveJSON(cfg.learning.file, stats);
+# ══════════════════════════════════════════════════════
+#  🔘  Telegram 按鈕回調（確認/跳過進場）
+# ══════════════════════════════════════════════════════
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query  = update.callback_query
+    await query.answer()
+    action, sym = query.data.split(":", 1)
+    st = states.get(sym)
 
-  tg(
-`🧠 自學參數更新
-最近 ${recent.length} 筆勝率：${fmt(winRate * 100, 2)}%
-flatTolerance：${cfg.params.flatTolerance}
-volumeMultiple：${cfg.params.volumeMultiple}
-RR 仍鎖死：1:${cfg.fixedRR}`
-  );
-}
+    if not st or not st.pending_signal:
+        await query.edit_message_text(f"⚠️ {sym} 信號已過期。")
+        return
 
-function sanitizeLearnedParams(p) {
-  return {
-    flatLookback: clampInt(p.flatLookback, 10, 50),
-    flatTolerance: clampNum(p.flatTolerance, 0.0015, 0.0035),
-    minTouches: clampInt(p.minTouches, 2, 4),
-    breakoutBuffer: clampNum(p.breakoutBuffer, 0.0005, 0.0025),
-    reclaimBars: clampInt(p.reclaimBars, 1, 5),
-    volumeMultiple: clampNum(p.volumeMultiple, 1.1, 2.0),
-    maxCandleRangePercent: clampNum(p.maxCandleRangePercent, 2.0, 6.0),
-    minVolumeUSDT: clampNum(p.minVolumeUSDT, 10000, 300000)
-  };
-}
+    sig = st.pending_signal
+    st.pending_signal = None
 
-// =====================
-// 主掃描
-// =====================
+    if action == "skip":
+        await query.edit_message_text(
+            f"❌ <b>{sym}</b> 信號跳過\n頂部: {sig['peak']:.6f}",
+            parse_mode="HTML",
+        )
+        return
 
-async function scanSymbol(symbol) {
-  try {
-    const candles = await getKlines(symbol, cfg.klineLimit);
+    # ── 確認進場 ───────────────────────────────────────
+    cfg     = st.cfg
+    dec     = cfg["qty_decimals"]
+    lev     = cfg["leverage"]
+    total_u = cfg["order_usdt"]
 
-    if (candles.length < 60) {
-      console.log(`[SKIP] ${symbol} K線不足`);
-      return;
-    }
+    set_leverage(sym, lev)
 
-    await manageTrade(symbol, candles);
+    # 取當前價格作為市價進場基準
+    market_price = get_last_price(sym)
 
-    const signal = detectSignal(symbol, candles);
-    if (!signal) return;
+    # ── 第1批：市價 50% ─────────────────────────────
+    market_usdt = total_u * cfg["entry_market_pct"]
+    market_qty  = fmt_qty(sym, (market_usdt * lev) / market_price, dec)
+    m_oid, m_price = place_market_short(sym, market_qty)
+    log.info(f"[{sym}] 第1批市價空單 qty={market_qty} ≈{m_price:.6f} oid={m_oid}")
 
-    const lastClosedBarTime = candles[candles.length - 2].time;
-    const sigKey = `${symbol}:${lastClosedBarTime}:${signal.side}`;
+    # ── 第2批：限價 50%，低 0.5% ────────────────────
+    limit_price = round(market_price * (1 - cfg["entry_limit_offset"]), 6)
+    limit_usdt  = total_u * cfg["entry_limit_pct"]
+    limit_qty   = fmt_qty(sym, (limit_usdt * lev) / limit_price, dec)
+    l_oid = place_limit_short(sym, limit_qty, limit_price)
+    log.info(f"[{sym}] 第2批限價空單 qty={limit_qty} @{limit_price:.6f} oid={l_oid}")
 
-    if (state.lastSignalBar[symbol] === sigKey) {
-      return;
-    }
+    # ── SL 設定（以市價批次為基準計算）─────────────
+    sl_price   = sig["sl"]
+    risk_1r    = sl_price - m_price           # 1R 距離（基於市價成交）
+    half_tp    = round(m_price - risk_1r * cfg["half_tp_r"], 6)
 
-    state.lastSignalBar[symbol] = sigKey;
+    set_sl_price(sym, sl_price)
 
-    const existing = getOpenTrade(symbol);
+    # ── 更新狀態 ────────────────────────────────────
+    st.in_position        = True
+    st.market_entry_price = m_price
+    st.limit_order_id     = l_oid
+    st.limit_price        = limit_price
+    st.sl_price           = sl_price
+    st.half_tp_price      = half_tp
+    st.half_exited        = False
+    st.trailing_active    = False
 
-    if (existing) {
-      await handleFlip(symbol, signal);
-    } else {
-      await openTrade(signal, false, false);
-    }
+    await query.edit_message_text(
+        f"✅ <b>{sym}</b> 進場完成！\n\n"
+        f"第1批 市價  {market_qty} 口 ≈ {m_price:.6f}\n"
+        f"第2批 限價  {limit_qty} 口 @ {limit_price:.6f} ⏳\n\n"
+        f"止損:    {sl_price:.6f}\n"
+        f"半倉TP:  {half_tp:.6f}  (1R)\n"
+        f"剩餘後: 移動止損 {cfg['trailing_pct']*100:.1f}%",
+        parse_mode="HTML",
+    )
 
-    saveJSON(cfg.stateFile, state);
 
-  } catch (err) {
-    console.log(`[ERROR] ${symbol}: ${err.message}`);
-    await tg(`🚨 Bybit 異常\n${symbol}\n${err.message}`);
-  }
-}
+# ══════════════════════════════════════════════════════
+#  🔁  倉位監控（半倉出場 + 移動止損）
+# ══════════════════════════════════════════════════════
+def monitor_positions():
+    for sym, st in states.items():
+        if not st.in_position:
+            continue
 
-// =====================
-// 主程式
-// =====================
+        pos = get_open_position(sym)
 
-async function main() {
-  console.log("======================================");
-  console.log("Bybit 小幣撥平頭 / 平底策略機器人啟動");
-  console.log(`模式：${ENV.DRY_RUN ? "DRY_RUN 模擬" : "正式下單"}`);
-  console.log(`環境：${ENV.TESTNET ? "TESTNET" : "MAINNET"}`);
-  console.log(`RR：1:${cfg.fixedRR}，已鎖死`);
-  console.log(`幣種：${cfg.symbols.join(", ")}`);
-  console.log("======================================");
+        # 倉位已不存在 → 全平了（止損或止盈）
+        if not pos:
+            log.info(f"[{sym}] 倉位已全平，重置狀態")
+            tg_notify(f"✅ <b>{sym}</b> 倉位已全部平倉\n/pnl 查看損益")
+            # 若限價單尚未成交，嘗試取消
+            cancel_order(sym, st.limit_order_id)
+            _reset_state(st)
+            continue
 
-  await tg(
-`🤖 Bybit 機器人啟動
-模式：${ENV.DRY_RUN ? "DRY_RUN 模擬" : "正式下單"}
-環境：${ENV.TESTNET ? "TESTNET" : "MAINNET"}
-幣種：${cfg.symbols.join(", ")}
-RR：1:${cfg.fixedRR} 已鎖死
-策略：平頭 / 平底 / 掃流動性 / 分倉移動止損`
-  );
+        price    = get_last_price(sym)
+        cur_size = float(pos["size"])
 
-  await syncExchangePositionsOnStart();
+        # ── 檢查限價單是否已成交（通知用）──────────
+        if st.limit_order_id and not st.half_exited:
+            if check_limit_filled(sym, st.limit_order_id):
+                tg_notify(
+                    f"📥 <b>{sym}</b> 第2批限價單已成交！\n"
+                    f"  @ {st.limit_price:.6f}  全倉部位已滿"
+                )
+                st.limit_order_id = ""   # 清除，避免重複通知
 
-  let lastPnlReport = 0;
+        # ── 達到半倉 TP（1R）→ 市價平一半 ──────────
+        if not st.half_exited and price <= st.half_tp_price:
+            half_qty = fmt_qty(sym, cur_size / 2, st.cfg["qty_decimals"])
+            oid = place_market_close(sym, half_qty)
+            st.half_exited = True
 
-  while (true) {
-    for (const symbol of cfg.symbols) {
-      await scanSymbol(symbol);
-      await sleep(600);
-    }
+            # 同時取消尚未成交的限價進場單
+            cancel_order(sym, st.limit_order_id)
+            st.limit_order_id = ""
 
-    if (Date.now() - lastPnlReport > 10 * 60 * 1000) {
-      lastPnlReport = Date.now();
-      await reportPnl();
-    }
+            log.info(f"[{sym}] 半倉出場 qty={half_qty} price={price:.6f} oid={oid}")
+            tg_notify(
+                f"🏁 <b>{sym}</b> 1R 達到，半倉出場！\n\n"
+                f"  出場數量: {half_qty}\n"
+                f"  出場價格: {price:.6f}\n"
+                f"  剩餘倉位啟動移動止損..."
+            )
 
-    await sleep(cfg.pollSeconds * 1000);
-  }
-}
+        # ── 半倉出場後啟動固定距離移動止損 ──────────
+        if st.half_exited and not st.trailing_active:
+            trail_dist = round(price * st.cfg["trailing_pct"], 6)
+            activate_trailing_stop(sym, trail_dist)
+            st.trailing_active = True
+            tg_notify(
+                f"🔄 <b>{sym}</b> 移動止損已啟動\n"
+                f"  追蹤距離: {trail_dist:.6f} ({st.cfg['trailing_pct']*100:.1f}%)\n"
+                f"  啟動時價格: {price:.6f}"
+            )
 
-main().catch(async err => {
-  console.error(err);
-  await tg(`🚨 Bybit Bot 主程式崩潰\n${err.message}`);
-  process.exit(1);
-});
+
+def fmt_qty(symbol_or_float, qty_or_dec=None, dec: int = 0) -> str:
+    """
+    支援兩種呼叫方式：
+      fmt_qty(symbol, raw_float, decimals)  → 用於計算
+      fmt_qty(raw_float, decimals)          → 用於監控
+    """
+    if isinstance(symbol_or_float, str):
+        raw = qty_or_dec
+        d   = dec
+    else:
+        raw = symbol_or_float
+        d   = qty_or_dec if qty_or_dec is not None else 0
+    return str(int(raw)) if d == 0 else str(round(raw, d))
+
+
+def _reset_state(st: SymbolState):
+    st.in_position        = False
+    st.pending_signal     = None
+    st.market_entry_price = 0.0
+    st.limit_order_id     = ""
+    st.limit_price        = 0.0
+    st.sl_price           = 0.0
+    st.half_tp_price      = 0.0
+    st.half_exited        = False
+    st.trailing_active    = False
+
+
+# ══════════════════════════════════════════════════════
+#  🏃  主交易迴圈（背景執行緒）
+# ══════════════════════════════════════════════════════
+def trading_loop():
+    log.info("=" * 56)
+    log.info("撥平頭機器人 v4.0 啟動")
+    log.info(f"Testnet={TESTNET} | 幣種: {list(states.keys())}")
+    log.info("=" * 56)
+    tg_notify(
+        "🚀 <b>撥平頭機器人 v4.0 啟動</b>\n\n"
+        "幣種: " + " | ".join(states.keys()) + "\n"
+        "偵測到信號會推播請你確認進場\n"
+        "/start 查看所有指令"
+    )
+
+    while True:
+        try:
+            # 1. 監控現有倉位（半倉出場 / 移動止損）
+            monitor_positions()
+
+            # 2. 掃描新信號
+            if not bot_paused:
+                for sym, st in states.items():
+                    if st.in_position or st.pending_signal:
+                        continue
+                    if time.time() - st.last_signal_ts < st.cfg["signal_cooldown"]:
+                        continue
+
+                    cfg     = st.cfg
+                    candles = get_klines(sym, cfg["interval"], limit=cfg["lookback"] + 5)
+                    signal  = detect_flat_top(candles, cfg)
+
+                    if signal:
+                        st.pending_signal = signal
+                        st.last_signal_ts = time.time()
+                        log.info(f"[{sym}] 撥平頭信號！推播確認")
+                        tg_notify(
+                            f"⚠️ <b>{sym}</b> 偵測到撥平頭信號！\n\n"
+                            f"頂部阻力: <b>{signal['peak']:.6f}</b>\n"
+                            f"參考進場: {signal['entry']:.6f}\n"
+                            f"止損:     {signal['sl']:.6f}\n"
+                            f"風險(1R): {signal['risk']:.6f}\n"
+                            f"半倉TP:   {signal['half_tp']:.6f}\n\n"
+                            f"確認進場方式：\n"
+                            f"  第1批 50% 市價\n"
+                            f"  第2批 50% 限價 (進場價 -0.5%)",
+                            reply_markup=confirm_keyboard(sym),
+                        )
+                    else:
+                        price = candles[1]["close"]
+                        log.info(
+                            f"[{sym}] 無信號 | 收盤={price:.6f} | "
+                            f"{datetime.now().strftime('%H:%M:%S')}"
+                        )
+
+        except Exception as e:
+            log.error(f"主迴圈錯誤: {e}", exc_info=True)
+            tg_notify(f"⚠️ <b>機器人錯誤</b>\n{e}")
+
+        time.sleep(POLL_SEC)
+
+
+# ══════════════════════════════════════════════════════
+#  🚀  入口
+# ══════════════════════════════════════════════════════
+def main():
+    global tg_app
+
+    tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start",   cmd_start))
+    tg_app.add_handler(CommandHandler("status",  cmd_status))
+    tg_app.add_handler(CommandHandler("pnl",     cmd_pnl))
+    tg_app.add_handler(CommandHandler("balance", cmd_balance))
+    tg_app.add_handler(CommandHandler("pause",   cmd_pause))
+    tg_app.add_handler(CommandHandler("resume",  cmd_resume))
+    tg_app.add_handler(CommandHandler("close",   cmd_close))
+    tg_app.add_handler(CallbackQueryHandler(handle_callback))
+
+    threading.Thread(target=trading_loop, daemon=True).start()
+
+    log.info("Telegram Bot 啟動中...")
+    tg_app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
