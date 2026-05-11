@@ -241,6 +241,19 @@ async function enterPosition(symbol,signal){
     // 設定 SL
     await setSL(symbol,signal.sl);
 
+    // ✅ 設定半倉止盈（在 Bybit 直接設定）
+    try{
+      await bybitReq('POST','/v5/position/trading-stop',{
+        category:'linear',symbol:symbol,
+        takeProfit:String(halfTp),
+        tpTriggerBy:'MarkPrice',
+        tpslMode:'Partial',
+        tpSize:String(marketQty), // 半倉數量
+        positionIdx:0
+      });
+      log('OK',symbol+' 半倉TP設定: '+halfTp+' qty='+marketQty);
+    }catch(e){log('WARN',symbol+' 半倉TP設定失敗: '+e.message);}
+
     // 計算半倉止盈
     var risk1r=signal.sl-marketPrice;
     var halfTp=parseFloat((marketPrice-risk1r*cfg.halfTpR).toFixed(6));
@@ -260,7 +273,7 @@ async function enterPosition(symbol,signal){
       limitQty:limitQty
     };
 
-    tg('[Bybit 撥平頭] ✅ 進場完成！\n'+symbol+'\n\n第1批 市價 '+marketQty+' qty ≈'+marketPrice+'\n第2批 限價 '+limitQty+' qty @'+limitPrice+' ⏳\n\n止損: '+signal.sl+'\n半倉TP(1R): '+halfTp+'\n移動止損: 啟動後 '+cfg.trailingPct*100+'%');
+    tg('[Bybit 撥平頭] ✅ 進場完成！\n'+symbol+'\n\n【分批進場】\n第1批 市價: '+marketQty+' qty ≈'+marketPrice+'\n第2批 限價: '+(lOrder?limitQty+' qty @'+limitPrice:'❌ 失敗，僅第1批')+'\n\n【出場設定】\nSL: '+signal.sl+'\n半倉TP(1R): '+halfTp+'\n移動止損: 觸發後 '+cfg.trailingPct*100+'%');
     log('OK',symbol+' 進場完成 marketEntry='+marketPrice+' sl='+signal.sl+' halfTp='+halfTp);
   }catch(e){
     log('ERROR',symbol+' 進場失敗: '+e.message);
