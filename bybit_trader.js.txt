@@ -13,8 +13,8 @@ const ENV={
 var cfg={
   symbols:['DOGEUSDT','XRPUSDT','SOLUSDT'],
   leverage:5,
-  orderUsdt:10,        // 每筆總名義倉位 USDT
-  lookback:150,        // 回看K線數
+  orderUsdt:2,         // 保證金 2U × 槓桿 5x = 10U 名義倉位
+  lookback:16,         // 回看K線數
   tolerance:0.002,     // 平頂容差 0.2%
   slBuffer:0.002,      // SL 高於頂部 0.2%
   entryMarketPct:0.5,  // 第1批市價 50%
@@ -25,7 +25,7 @@ var cfg={
   signalCooldown:300,  // 信號冷卻秒數
   timeframe:'15',      // K線時框（分鐘）
   botRunning:false,
-  requireConfirm:true  // 需要 Telegram 確認才進場
+  requireConfirm:false // ✅ 自動進場，不需要確認
 };
 
 var states={};  // 每個幣種的狀態
@@ -82,7 +82,15 @@ function bybitReq(method,path,params,tries){
 
 async function getBalance(){
   var r=await bybitReq('GET','/v5/account/wallet-balance',{accountType:'UNIFIED'});
-  if(r.retCode===0){var coins=r.result.list[0].coin;var usdt=coins.find(function(c){return c.coin==='USDT';})||{};return{available:parseFloat(usdt.availableToWithdraw||0),total:parseFloat(usdt.walletBalance||0),unrealPnl:parseFloat(usdt.unrealisedPnl||0)};}
+  if(r.retCode===0){
+    var coins=r.result.list[0].coin;
+    var usdt=coins.find(function(c){return c.coin==='USDT';})||{};
+    return{
+      available:parseFloat(usdt.availableToWithdraw||usdt.availableToBorrow||usdt.walletBalance||0),
+      total:parseFloat(usdt.walletBalance||usdt.equity||0),
+      unrealPnl:parseFloat(usdt.unrealisedPnl||0)
+    };
+  }
   throw new Error('Cannot get balance');
 }
 
@@ -109,10 +117,22 @@ async function getPosition(symbol){
   return[];
 }
 
-async function getClosedPnl(symbol,limit){
-  var r=await bybitReq('GET','/v5/position/closed-pnl',{category:'linear',symbol:symbol,limit:limit||10});
-  if(r.retCode===0)return r.result.list||[];
-  return[];
+async function getActualPnl(symbol,openTime){
+  try{
+    var r=await bybitReq('GET','/v5/position/closed-pnl',{category:'linear',symbol:symbol,limit:10});
+    if(r.retCode===0&&r.result.list&&r.result.list.length>0){
+      var trades=r.result.list.filter(function(t){
+        return parseInt(t.updatedTime||t.createdTime||0)>openTime;
+      });
+      if(trades.length>0){
+        var latest=trades[0];
+        var pnl=parseFloat(latest.closedPnl||0);
+        log('INFO',symbol+' API實際PnL: '+pnl.toFixed(4)+'U');
+        return{pnl:pnl,exitPrice:parseFloat(latest.avgExitPrice||0)};
+      }
+    }
+  }catch(e){log('WARN','getActualPnl: '+e.message);}
+  return null;
 }
 
 async function setLeverage(symbol,lev){
@@ -192,18 +212,19 @@ async function enterPosition(symbol,signal){
 
     var totalUsdt=cfg.orderUsdt;
     var lev=cfg.leverage;
+    var notional=totalUsdt*lev; // 名義倉位 = 保證金 × 槓桿
 
     // 第1批：市價 50%
-    var marketUsdt=totalUsdt*cfg.entryMarketPct;
-    var marketQty=Math.floor((marketUsdt*lev/marketPrice)*100)/100;
+    var marketNotional=notional*cfg.entryMarketPct;
+    var marketQty=Math.floor((marketNotional/marketPrice)*100)/100;
     if(marketQty<=0){log('WARN',symbol+' 數量為0');return;}
     var mOrder=await placeOrder(symbol,'Sell',marketQty,'Market',null,false);
     log('OK',symbol+' 第1批市價空單 qty='+marketQty+' orderId='+mOrder.orderId);
 
     // 第2批：限價低0.5%
     var limitPrice=parseFloat((marketPrice*(1-cfg.entryLimitOffset)).toFixed(6));
-    var limitUsdt=totalUsdt*cfg.entryLimitPct;
-    var limitQty=Math.floor((limitUsdt*lev/limitPrice)*100)/100;
+    var limitNotional=notional*cfg.entryLimitPct;
+    var limitQty=Math.floor((limitNotional/limitPrice)*100)/100;
     var lOrder=await placeOrder(symbol,'Sell',limitQty,'Limit',limitPrice,false);
     log('OK',symbol+' 第2批限價空單 qty='+limitQty+' @'+limitPrice+' orderId='+lOrder.orderId);
 
@@ -251,10 +272,12 @@ async function monitorPositions(){
       // 倉位已不存在
       if(pos.length===0){
         log('OK',sym+' 倉位已全平');
-        var pnlList=await getClosedPnl(sym,5);
-        var totalPnl=pnlList.reduce(function(s,r){return s+parseFloat(r.closedPnl||0);},0);
+        await new Promise(function(res){setTimeout(res,1500);});
+        var actual=await getActualPnl(sym,st.openTime);
+        var totalPnl=actual?actual.pnl:0;
+        var source=actual?'API實際':'無法取得';
         recordTrade({symbol:sym,side:'SHORT',entry:st.marketEntry,pnl:totalPnl,reason:'平倉'});
-        tg('[Bybit 撥平頭] ✅ '+sym+' 倉位已全平\n實際PnL: '+(totalPnl>=0?'+':'')+totalPnl.toFixed(4)+'U\n/pnl 查看詳情');
+        tg('[Bybit 撥平頭] '+(totalPnl>=0?'✅ 獲利':'❌ 虧損')+'\n'+sym+'\nPnL('+source+'): '+(totalPnl>=0?'+':'')+totalPnl.toFixed(4)+'U\n/pnl 查看詳情');
         await cancelOrder(sym,st.limitOrderId);
         delete states[sym];
         continue;
@@ -309,7 +332,7 @@ async function tradingLoop(){
         // 冷卻時間
         if(lastSignalTs[sym]&&(Date.now()-lastSignalTs[sym])<cfg.signalCooldown*1000)continue;
 
-        var candles=await getKlines(sym,cfg.timeframe,cfg.lookback+5);
+        var candles=await getKlines(sym,cfg.timeframe,21); // 16根已收盤+5備用
         if(candles.length<10){log('WARN',sym+' K線不足');continue;}
 
         var signal=detectFlatTop(candles);
@@ -426,10 +449,12 @@ function handleUpdate(update){
   }
 
   if(cmd==='/pnl'){
-    Promise.all(cfg.symbols.map(function(s){return getClosedPnl(s,5);})).then(function(results){
+    Promise.all(cfg.symbols.map(function(s){
+      return bybitReq('GET','/v5/position/closed-pnl',{category:'linear',symbol:s,limit:5});
+    })).then(function(results){
       var lines='[Bybit] 💰 近期損益\n\n';
       cfg.symbols.forEach(function(s,i){
-        var records=results[i];
+        var records=(results[i].retCode===0?results[i].result.list||[]:[]);
         if(!records.length){lines+=s+': 無紀錄\n\n';return;}
         var total=records.reduce(function(sum,r){return sum+parseFloat(r.closedPnl||0);},0);
         lines+=s+' 近5筆: '+(total>=0?'+':'')+total.toFixed(4)+'U\n';
