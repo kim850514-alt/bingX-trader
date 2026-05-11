@@ -135,7 +135,15 @@ async function getActualPnl(symbol,openTime){
   return null;
 }
 
-async function setLeverage(symbol,lev){
+function getQtyStep(price){
+  if(price>=10000)return 0.001;  // BTC
+  if(price>=1000)return 0.01;   // ETH
+  if(price>=100)return 0.1;     // SOL BNB
+  if(price>=1)return 1;         // XRP ADA
+  if(price>=0.01)return 1;      // DOGE
+  return 1;
+}
+function roundQty(qty,step){return Math.floor(qty/step)*step;}
   try{await bybitReq('POST','/v5/position/set-leverage',{category:'linear',symbol:symbol,buyLeverage:String(lev),sellLeverage:String(lev)});}catch(e){}
 }
 
@@ -213,18 +221,20 @@ async function enterPosition(symbol,signal){
     var totalUsdt=cfg.orderUsdt;
     var lev=cfg.leverage;
     var notional=totalUsdt*lev; // 名義倉位 = 保證金 × 槓桿
+    var step=getQtyStep(marketPrice);
 
     // 第1批：市價 50%
     var marketNotional=notional*cfg.entryMarketPct;
-    var marketQty=Math.floor((marketNotional/marketPrice)*100)/100;
-    if(marketQty<=0){log('WARN',symbol+' 數量為0');return;}
+    var marketQty=roundQty(marketNotional/marketPrice,step);
+    if(marketQty<=0){log('WARN',symbol+' 數量為0，保證金不足');return;}
     var mOrder=await placeOrder(symbol,'Sell',marketQty,'Market',null,false);
     log('OK',symbol+' 第1批市價空單 qty='+marketQty+' orderId='+mOrder.orderId);
 
     // 第2批：限價低0.5%
     var limitPrice=parseFloat((marketPrice*(1-cfg.entryLimitOffset)).toFixed(6));
     var limitNotional=notional*cfg.entryLimitPct;
-    var limitQty=Math.floor((limitNotional/limitPrice)*100)/100;
+    var limitQty=roundQty(limitNotional/limitPrice,step);
+    if(limitQty<=0)limitQty=step; // 最少1個步進
     var lOrder=await placeOrder(symbol,'Sell',limitQty,'Limit',limitPrice,false);
     log('OK',symbol+' 第2批限價空單 qty='+limitQty+' @'+limitPrice+' orderId='+lOrder.orderId);
 
