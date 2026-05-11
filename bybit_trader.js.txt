@@ -50,7 +50,7 @@ SYMBOLS_CONFIG: dict[str, dict] = {
         "enabled":          True,
         "interval":         "15",    # K線週期（分鐘）
         "leverage":         5,
-        "order_usdt":       30,      # 每次信號總名義倉位 USDT
+        "order_usdt":       10,      # 每次信號總名義倉位 USDT
         "lookback":         150,     # 回看K線根數
         "tolerance":        0.002,   # 平頂容差 0.2%
         "sl_buffer":        0.002,   # SL 高於頂部 0.2%
