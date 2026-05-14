@@ -67,11 +67,13 @@ function createBot(token,chatId,name,apiKey,secret){
     name:name||'用戶',
     apiKey:apiKey,
     secret:secret,
+    role:'user', // ✅ 角色：user / leader
     cfg:{
       symbols:['DOGE-USDT','XRP-USDT','SIREN-USDT'],
       botRunning:false,
       allowShort:true,
-      amount:1
+      amount:1,
+      copyFrom:null // 跟單哪個leader的token
     },
     openTrades:{},
     stats:{allTime:{total:0,wins:0,losses:0,pnl:0},daily:{},trades:[]},
@@ -308,30 +310,18 @@ async function checkPositions(b){
       var estPnl=ps==='LONG'?(cur-t.entry)*t.qty*layerCfg.lev:(t.entry-cur)*t.qty*layerCfg.lev;
       var estPct=ps==='LONG'?(cur-t.entry)/t.entry*100:(t.entry-cur)/t.entry*100;
       log('INFO','持倉 '+t.symbol+' ['+layer+'] '+estPct.toFixed(2)+'% Hold:'+holdMin+'min',b);
-      // 移動止損
+      // ✅ 移動止損：達到 TP1 時，SL 移到開倉價和 TP1 中間
       var tpPct=Math.max(MIN_SL*MIN_RR,layerCfg.tp),tp1Pct=tpPct*0.5;
       if(estPct>=tp1Pct&&!t.slMoved){
         t.slMoved=true;
-        var newSl=ps==='LONG'?+(t.entry*(1+tp1Pct*0.5/100)).toFixed(4):+(t.entry*(1-tp1Pct*0.5/100)).toFixed(4);
-        try{await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:t.symbol,side:ps==='LONG'?'SELL':'BUY',positionSide:ps,type:'STOP_MARKET',stopPrice:String(newSl),quantity:String(t.qty),workingType:'MARK_PRICE'},b.apiKey,b.secret);tgBot(b,'[BingX] 🔒 止損上移\n'+t.symbol+' 新止損:'+newSl);}catch(e){}
+        var tp1Price=ps==='LONG'?t.entry*(1+tp1Pct/100):t.entry*(1-tp1Pct/100);
+        var newSl=ps==='LONG'?+((t.entry+tp1Price)/2).toFixed(4):+((t.entry+tp1Price)/2).toFixed(4);
+        try{
+          await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:t.symbol,side:ps==='LONG'?'SELL':'BUY',positionSide:ps,type:'STOP_MARKET',stopPrice:String(newSl),quantity:String(t.qty),workingType:'MARK_PRICE'},b.apiKey,b.secret);
+          tgBot(b,'[BingX] 🔒 止損上移\n'+t.symbol+' ['+layerCfg.name+']\n新止損: '+newSl+'\n鎖定約 '+(tp1Pct*0.5).toFixed(2)+'% 獲利');
+        }catch(e){}
       }
-      // 移動止盈
-      if(estPct>=tp1Pct){
-        if(!t.maxPct||estPct>t.maxPct){t.maxPct=estPct;if(!t.trailNotified){t.trailNotified=true;tgBot(b,'[BingX] 🔒 移動止盈啟動\n'+t.symbol+' +'+estPct.toFixed(2)+'%');}}
-        if(t.maxPct&&t.maxPct-estPct>=0.5){
-          var ot=await ax.closePos(t.symbol,ps,t.qty).catch(function(){return null;});
-          if(ot){
-            await new Promise(function(r2){setTimeout(r2,1500);});
-            var a2=await ax.getActualPnl(t.symbol,t.openTime);
-            var p2=a2?a2.pnl:estPnl;
-            recordTrade(b,{symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:p2,holdMin:holdMin,reason:'移動止盈',layer:layer});
-            delete b.openTrades[key];
-            tgBot(b,'[BingX] 🔒 移動止盈\n'+t.symbol+' ['+layerCfg.name+']\nPnL:'+(p2>=0?'✅ +':'❌ ')+p2.toFixed(4)+'U Hold:'+holdMin+'min');
-            continue;
-          }
-        }
-      }
-      // 反向訊號
+            // 反向訊號
       if(holdMin>=5&&stillOpen){
         var res=await calcSignal(b,ax,t.symbol,layer).catch(function(){return null;});
         if(res){
@@ -400,7 +390,13 @@ async function tradingLoop(b){
           var layerAmt=Object.assign({},layerCfg,{amt:amt});
           if(res.signal==='BUY'){
             var o=await ax.placeOrder({symbol:sym,side:'BUY',positionSide:'LONG',amt:amt,lev:layerCfg.lev,price:cur,stopLoss:slP,takeProfit:tpP,layer:layerCfg.name});
-            if(o){b.lastSignalTs[coolKey]=Date.now();b.openTrades[sym+'_'+layerName+'_L']={symbol:sym,side:'LONG',entry:cur,qty:1,layer:layerName,openTime:Date.now()};}
+            if(o){
+            var tradeKey=sym+'_'+layerName+'_'+(res.signal==='BUY'?'L':'S');
+            b.lastSignalTs[coolKey]=Date.now();
+            b.openTrades[tradeKey]={symbol:sym,side:res.signal==='BUY'?'LONG':'SHORT',entry:cur,qty:1,layer:layerName,openTime:Date.now()};
+            // ✅ 觸發帶單
+            copyTrade(b,{symbol:sym,side:res.signal==='BUY'?'BUY':'SELL',positionSide:res.signal==='BUY'?'LONG':'SHORT',price:cur,stopLoss:slP,takeProfit:tpP,layer:layerName}).catch(function(){});
+          }
           }else if(res.signal==='SELL'&&b.cfg.allowShort){
             var o2=await ax.placeOrder({symbol:sym,side:'SELL',positionSide:'SHORT',amt:amt,lev:layerCfg.lev,price:cur,stopLoss:slP,takeProfit:tpP,layer:layerCfg.name});
             if(o2){b.lastSignalTs[coolKey]=Date.now();b.openTrades[sym+'_'+layerName+'_S']={symbol:sym,side:'SHORT',entry:cur,qty:1,layer:layerName,openTime:Date.now()};}
@@ -415,6 +411,73 @@ async function tradingLoop(b){
 // ══════════════════════════════════
 // 主循環（每分鐘掃描所有Bot）
 // ══════════════════════════════════
+// ══════════════════════════════════
+// 持倉恢復
+// ══════════════════════════════════
+async function recoverPositions(b){
+  try{
+    var ax=api(b);
+    var pos=await ax.getPositions();
+    if(!pos||pos.length===0)return;
+    var recovered=0;
+    for(var i=0;i<pos.length;i++){
+      var p=pos[i];
+      var amt=parseFloat(p.positionAmt||0);
+      if(amt===0)continue;
+      var sym=p.symbol;
+      var side=p.positionSide||'LONG';
+      var key=sym+'_swing_'+(side==='LONG'?'L':'S');
+      if(b.openTrades[key])continue;
+      b.openTrades[key]={symbol:sym,side:side,entry:parseFloat(p.avgPrice||0),qty:Math.abs(amt),layer:'swing',openTime:Date.now()-30*60000};
+      recovered++;
+      log('INFO','恢復持倉: '+sym+' '+side,b);
+    }
+    if(recovered>0){
+      saveBots();
+      tgBot(b,'[BingX] 🔄 恢復 '+recovered+' 個持倉');
+    }
+  }catch(e){log('WARN','recoverPositions: '+e.message,b);}
+}
+
+// ══════════════════════════════════
+// 帶單跟單
+// ══════════════════════════════════
+// 跟單設定儲存在 bots[token].copyFrom = '主帳號token'
+async function copyTrade(masterBot,tradeInfo){
+  // 只有帶單員（leader）開單才觸發跟單
+  if(masterBot.role!=='leader')return;
+  var followers=Object.values(bots).filter(function(b){
+    return b.cfg&&b.cfg.copyFrom===masterBot.token&&b.cfg.botRunning&&b.token!==masterBot.token;
+  });
+  if(!followers.length)return;
+  log('INFO','帶單: '+tradeInfo.symbol+' '+tradeInfo.side+' 跟單人數:'+followers.length);
+  for(var i=0;i<followers.length;i++){
+    var fb=followers[i];
+    try{
+      var ax=api(fb);
+      var amt=fb.cfg.amount||1;
+      var layerCfg=LAYERS[tradeInfo.layer]||LAYERS.swing;
+      var o=await ax.placeOrder({
+        symbol:tradeInfo.symbol,
+        side:tradeInfo.side,
+        positionSide:tradeInfo.positionSide,
+        amt:amt,
+        lev:layerCfg.lev,
+        price:tradeInfo.price,
+        stopLoss:tradeInfo.stopLoss,
+        takeProfit:tradeInfo.takeProfit,
+        layer:'跟單'
+      });
+      if(o){
+        var key=tradeInfo.symbol+'_'+tradeInfo.layer+'_'+(tradeInfo.positionSide==='LONG'?'L':'S');
+        fb.openTrades[key]={symbol:tradeInfo.symbol,side:tradeInfo.positionSide,entry:tradeInfo.price,qty:1,layer:tradeInfo.layer,openTime:Date.now()};
+        saveBots();
+        tgBot(fb,'[BingX] 📋 跟單成功\n'+tradeInfo.symbol+' ['+(tradeInfo.side==='BUY'?'🟢 多':'🔴 空')+']\n跟隨: '+masterBot.name);
+      }
+    }catch(e){log('ERROR','跟單失敗 '+fb.name+': '+e.message,fb);}
+  }
+}
+
 function startMainLoop(){
   setInterval(function(){
     Object.values(bots).forEach(function(b){
@@ -483,7 +546,7 @@ function handleBotUpdate(b,update){
   log('INFO','CMD: '+cmd+' from '+b.name,b);
 
   if(cmd==='/help'||cmd==='/start'){
-    tgBot(b,'🐎 BingX 三層策略\n\n/go - 啟動\n/stop - 停止\n/status - 狀態\n/stats - 績效\n/positions - 持倉\n/history - 近10筆\n/set amount N - 開倉金額');return;
+    tgBot(b,'🐎 BingX 三層策略\n\n/go - 啟動\n/stop - 停止\n/status - 狀態\n/stats - 績效\n/positions - 持倉\n/history - 近10筆\n/set amount N - 開倉金額\n/copy 名稱 - 跟單\n/stopcopy - 取消跟單');return;
   }
   if(cmd==='/go'){
     if(b.cfg.botRunning){tgBot(b,'⚠️ 已在運行');return;}
@@ -517,6 +580,30 @@ function handleBotUpdate(b,update){
     var amt=parseFloat(parts[2]);
     if(amt>=1&&amt<=100){b.cfg.amount=amt;saveBots();tgBot(b,'✅ 開倉金額 -> '+amt+'U × 5x = '+(amt*5)+'U 名義');}
     else tgBot(b,'金額需在 1-100U 之間');return;
+  }
+  if(cmd==='/copy'){
+    if(!parts[1]){
+      // 顯示可跟單的帶單員
+      var leaders=Object.values(bots).filter(function(lb){return lb.role==='leader';});
+      if(!leaders.length){tgBot(b,'目前沒有帶單員');return;}
+      tgBot(b,'🌟 可跟單的帶單員:\n'+leaders.map(function(lb){return lb.name;}).join('\n')+'\n\n/copy 名稱 開始跟單');return;
+    }
+    var masterName=parts[1];
+    var masterBot=Object.values(bots).find(function(mb){return mb.name===masterName&&mb.role==='leader';});
+    if(masterBot){
+      b.cfg.copyFrom=masterBot.token;
+      saveBots();
+      tgBot(b,'✅ 已設定跟單: '+masterName+'\n每次開單自動跟隨\n\n/stopcopy 取消跟單');
+    }else{
+      tgBot(b,'❌ 找不到帶單員: '+masterName+'\n\n發 /copy 查看可跟單的帶單員');
+    }
+    return;
+  }
+  if(cmd==='/stopcopy'){
+    delete b.cfg.copyFrom;
+    saveBots();
+    tgBot(b,'✅ 已取消跟單');
+    return;
   }
   if(text.startsWith('/'))tgBot(b,'未知指令，輸入 /help');
 }
@@ -561,7 +648,7 @@ function handleAdminUpdate(update){
   log('INFO','ADMIN CMD: '+cmd);
 
   if(cmd==='/help'){
-    tgAdmin('👑 管理員指令\n\n/addbot TOKEN NAME APIKEY SECRET - 新增Bot\n/bots - 所有Bot狀態\n/delbot TOKEN - 刪除Bot\n/scalp N - 短期門檻(全部)\n/swing N - 中期門檻(全部)\n/long N - 長期門檻(全部)\n/log - 系統日誌\n/broadcast 訊息 - 廣播給所有用戶');return;
+    tgAdmin('👑 管理員指令\n\n/addbot TOKEN NAME APIKEY SECRET - 新增Bot\n/bots - 所有Bot狀態\n/delbot TOKEN - 刪除Bot\n/setleader 名稱 - 設定帶單員\n/removeleader 名稱 - 移除帶單員\n/leaders - 帶單員列表\n/scalp N - 短期門檻(全部)\n/swing N - 中期門檻(全部)\n/long N - 長期門檻(全部)\n/log - 系統日誌\n/broadcast 訊息 - 廣播');return;
   }
 
   if(cmd==='/addbot'&&parts.length>=5){
@@ -588,6 +675,31 @@ function handleAdminUpdate(update){
       m+=b.name+': '+(b.cfg.botRunning?'🟢':'🔴')+' 持倉:'+Object.keys(b.openTrades).length+' 累計:'+b.stats.allTime.pnl.toFixed(2)+'U\n';
     });
     tgAdmin(m);return;
+  }
+
+  if(cmd==='/setleader'&&parts[1]){
+    var leaderName=parts[1];
+    var leaderBot=Object.values(bots).find(function(b){return b.name===leaderName;});
+    if(leaderBot){
+      leaderBot.role='leader';saveBots();
+      tgAdmin('✅ 已設定帶單員: '+leaderName);
+      tgBot(leaderBot,'🌟 您已獲得帶單員權限\n您的開單將會帶動跟單者');
+    }else tgAdmin('找不到: '+leaderName);return;
+  }
+
+  if(cmd==='/removeleader'&&parts[1]){
+    var rName=parts[1];
+    var rBot=Object.values(bots).find(function(b){return b.name===rName;});
+    if(rBot){
+      rBot.role='user';saveBots();
+      tgAdmin('✅ 已移除帶單員: '+rName);
+      tgBot(rBot,'⚠️ 您的帶單員權限已被移除');
+    }else tgAdmin('找不到: '+rName);return;
+  }
+
+  if(cmd==='/leaders'){
+    var leaders=Object.values(bots).filter(function(b){return b.role==='leader';});
+    tgAdmin('🌟 帶單員列表\n'+(leaders.length?leaders.map(function(b){return b.name+' (跟單:'+Object.values(bots).filter(function(f){return f.cfg&&f.cfg.copyFrom===b.token;}).length+'人)';}).join('\n'):'尚無帶單員'));return;
   }
 
   if(cmd==='/delbot'&&parts[1]){
@@ -622,8 +734,11 @@ async function main(){
   startServer();
   startMainLoop();
   startAdminPolling();
-  // 啟動所有已有Bot的polling
-  Object.values(bots).forEach(function(b){startBotPolling(b);});
+  // 啟動所有已有Bot的polling並恢復持倉
+  Object.values(bots).forEach(function(b){
+    startBotPolling(b);
+    recoverPositions(b).catch(function(){});
+  });
   var activeCount=Object.values(bots).filter(function(b){return b.cfg&&b.cfg.botRunning;}).length;
   tgAdmin('[BingX 伺服器] 🟢 上線!\n共 '+Object.keys(bots).length+' 個Bot\n運行中: '+activeCount+'\n\n新增Bot:\n/addbot TOKEN 名稱 APIKEY SECRET');
   log('OK','Ready. Bots: '+Object.keys(bots).length);
