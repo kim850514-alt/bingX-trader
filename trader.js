@@ -9,11 +9,22 @@ const ADMIN_TOKEN=process.env.BYBIT_TG_TOKEN||''; // 海馬Bot Token（管理員
 
 // 共用策略設定（管理員修改，全部用戶同步）
 const LAYERS={
-  scalp:{name:'短期',tf:'3m',sl:1.0,tp:1.5,lev:5,amt:1,threshold:3,maxHold:15},
-  swing:{name:'中期',tf:'5m',sl:2.0,tp:3.0,lev:5,amt:1,threshold:3,maxHold:120},
-  long: {name:'長期',tf:'1h',sl:3.0,tp:6.0,lev:5,amt:1,threshold:3,maxHold:1440}
+  scalp:{name:'短期',tf:'3m',sl:1.0,tp:1.5,lev:5,amt:1,threshold:4,maxHold:60},
+  swing:{name:'中期',tf:'5m',sl:2.0,tp:3.0,lev:5,amt:1,threshold:4,maxHold:360},
+  long: {name:'長期',tf:'1h',sl:3.0,tp:6.0,lev:5,amt:1,threshold:4,maxHold:2880}
 };
 const MIN_SL=1.0,MIN_RR=1.5;
+const MAX_SAME_DIR=5; // 同方向最多5張單
+// 所有技術指標參數限制範圍（不可超出）
+const PARAM_LIMITS={
+  oversold:    {min:25, max:35},   // RSI 超賣 30±5
+  overbought:  {min:65, max:75},   // RSI 超買 70±5
+  rsiPeriod:   {min:5,  max:14},   // RSI 週期
+  bbPeriod:    {min:10, max:25},   // BB 週期
+  bbStdDev:    {min:1.5,max:2.5},  // BB 標準差 2±0.5
+  volMultiple: {min:1.0,max:2.0},  // 成交量倍數
+};
+function clamp(val,key){var l=PARAM_LIMITS[key];if(!l)return val;return Math.min(l.max,Math.max(l.min,val));}
 
 // ══════════════════════════════════
 // 用戶管理
@@ -201,7 +212,14 @@ async function calcSignal(b,ax,sym,layer){
   var closes=kl.map(function(k){return parseFloat(k.close||k[4]||0);});
   var vols=kl.map(function(k){return parseFloat(k.volume||k[5]||0);});
   var last=closes[closes.length-1];
-  var p={rsiPeriod:7,oversold:35,overbought:65,volMultiple:1.3,bbPeriod:15,bbStdDev:2};
+  var p={
+    rsiPeriod:clamp(7,'rsiPeriod'),
+    oversold:clamp(35,'oversold'),
+    overbought:clamp(65,'overbought'),
+    volMultiple:clamp(1.3,'volMultiple'),
+    bbPeriod:clamp(15,'bbPeriod'),
+    bbStdDev:clamp(2,'bbStdDev')
+  };
   var bs=0,ss=0,rsn=[];
   var rsi=I.rsi(closes,p.rsiPeriod),rsiPrev=I.rsi(closes.slice(0,-1),p.rsiPeriod);
   if(rsi!==null&&rsiPrev!==null){
@@ -369,6 +387,10 @@ async function tradingLoop(b){
           if(b.lastSignalTs[coolKey]&&(Date.now()-b.lastSignalTs[coolKey])<300000)continue;
           var res=await calcSignal(b,ax,sym,layerName);
           if(!res||res.signal==='HOLD')continue;
+          // ✅ 同方向最多5張單
+          var dirKey=res.signal==='BUY'?'_L':'_S';
+          var sameDir=Object.keys(b.openTrades).filter(function(k){return k.endsWith(dirKey);}).length;
+          if(sameDir>=MAX_SAME_DIR){log('INFO',sym+' ['+layerName+'] 同方向已達'+MAX_SAME_DIR+'張上限',b);continue;}
           if(bal.available<amt)continue;
           var cur=res.price;
           if(!cur||isNaN(cur))continue;
