@@ -366,44 +366,88 @@ async function analyzeHunter(sym,ax){
 var marketScanResult={topBuy:[],topSell:[],lastScan:0};
 
 async function scanMarket(){
-  log('INFO','=== 開始全市場掃描 ===');
+  log('INFO','=== 開始全市場情緒掃描 ===');
   try{
-    // 取得所有合約的 ticker
+    // 取得所有合約的 ticker（用成交量篩出活躍幣種）
     var r=await bxPublic('/openApi/swap/v2/quote/ticker');
     if(r.code!==0||!r.data)return;
 
     var tickers=r.data.filter(function(t){
-      return t.symbol&&t.symbol.endsWith('-USDT')&&parseFloat(t.quoteVolume||0)>0;
+      return t.symbol&&t.symbol.endsWith('-USDT')&&parseFloat(t.quoteVolume||0)>500000;
     });
 
-    // 按漲幅排序
-    var sorted=tickers.sort(function(a,b){
-      return parseFloat(b.priceChangePercent||0)-parseFloat(a.priceChangePercent||0);
-    });
+    // 按成交量排序，取前100名活躍幣種
+    var active=tickers.sort(function(a,b){
+      return parseFloat(b.quoteVolume||0)-parseFloat(a.quoteVolume||0);
+    }).slice(0,100);
 
-    // 取漲幅前10（做多候選）和跌幅前10（做空候選）
-    var topGainers=sorted.slice(0,10);
-    var topLosers=sorted.slice(-10).reverse();
+    log('INFO','活躍幣種: '+active.length+'個，開始取OI和資金費率...');
 
-    log('INFO','漲幅前3: '+topGainers.slice(0,3).map(function(t){return t.symbol+'('+t.priceChangePercent+'%)';}).join(', '));
-    log('INFO','跌幅前3: '+topLosers.slice(0,3).map(function(t){return t.symbol+'('+t.priceChangePercent+'%)';}).join(', '));
+    // 對每個幣取 OI 和資金費率，計算情緒分數
+    var scored=[];
+    for(var i=0;i<active.length;i++){
+      var t=active[i];
+      try{
+        var sym=t.symbol;
+        var prevOI=oiHistory[sym]||0;
+        var oiR=await bxPublic('/openApi/swap/v2/quote/openInterest',{symbol:sym});
+        var curOI=oiR.code===0?parseFloat(oiR.data.openInterest||0):0;
+        var oiChange=prevOI>0?(curOI-prevOI)/prevOI:0;
+        oiHistory[sym]=curOI;
+
+        var frR=await bxPublic('/openApi/swap/v2/quote/premiumIndex',{symbol:sym});
+        var fr=frR.code===0?parseFloat(frR.data.lastFundingRate||0):0;
+
+        // 做多情緒分數：OI上升 + 資金費率越負越強
+        var longScore=0,shortScore=0;
+        if(oiChange>0.01){
+          longScore=oiChange*100+(fr<0?Math.abs(fr)*1000:0);
+          shortScore=oiChange*100+(fr>0?fr*1000:0);
+        }
+
+        scored.push({
+          symbol:sym,
+          oiChange,fr,
+          longScore,shortScore,
+          price:parseFloat(t.lastPrice),
+          changePercent:parseFloat(t.priceChangePercent||0)
+        });
+      }catch(e){}
+      // 避免API限流
+      if(i%10===0)await new Promise(function(res){setTimeout(res,200);});
+    }
+
+    // 按做多情緒排序，取前3
+    var topBuy=scored.filter(function(s){return s.longScore>0;})
+      .sort(function(a,b){return b.longScore-a.longScore;}).slice(0,3);
+
+    // 按做空情緒排序，取前3
+    var topSell=scored.filter(function(s){return s.shortScore>0;})
+      .sort(function(a,b){return b.shortScore-a.shortScore;}).slice(0,3);
+
+    log('INFO','做多情緒前3: '+topBuy.map(function(t){return t.symbol+'(OI:'+( t.oiChange*100).toFixed(1)+'% FR:'+(t.fr*100).toFixed(4)+'%)';}).join(', '));
+    log('INFO','做空情緒前3: '+topSell.map(function(t){return t.symbol+'(OI:'+( t.oiChange*100).toFixed(1)+'% FR:'+(t.fr*100).toFixed(4)+'%)';}).join(', '));
 
     marketScanResult={
-      topGainers:topGainers,
-      topLosers:topLosers,
+      topGainers:topBuy.map(function(s,i){return{symbol:s.symbol,direction:'BUY',rank:i+1,changePercent:s.changePercent,oiChange:s.oiChange,fr:s.fr};}),
+      topLosers:topSell.map(function(s,i){return{symbol:s.symbol,direction:'SELL',rank:i+1,changePercent:s.changePercent,oiChange:s.oiChange,fr:s.fr};}),
       lastScan:Date.now(),
       allTickers:tickers
     };
 
-    // 廣播掃描結果給所有運行中的用戶
-    var msg='📊 全市場掃描完成\n\n漲幅前3:\n';
-    topGainers.slice(0,3).forEach(function(t,i){
-      msg+=(i+1)+'名 '+t.symbol+' +'+parseFloat(t.priceChangePercent).toFixed(2)+'%\n';
+    // 廣播掃描結果
+    var msg='📊 全市場情緒掃描完成\n\n';
+    msg+='🟢 做多情緒前3:\n';
+    topBuy.forEach(function(t,i){
+      msg+=(i+1)+'名 '+t.symbol+'\n';
+      msg+='  OI: '+(t.oiChange*100).toFixed(2)+'% FR: '+(t.fr*100).toFixed(4)+'%\n';
     });
-    msg+='\n跌幅前3:\n';
-    topLosers.slice(0,3).forEach(function(t,i){
-      msg+=(i+1)+'名 '+t.symbol+' '+parseFloat(t.priceChangePercent).toFixed(2)+'%\n';
+    msg+='\n🔴 做空情緒前3:\n';
+    topSell.forEach(function(t,i){
+      msg+=(i+1)+'名 '+t.symbol+'\n';
+      msg+='  OI: '+(t.oiChange*100).toFixed(2)+'% FR: '+(t.fr*100).toFixed(4)+'%\n';
     });
+    msg+='\n每1分鐘持續監控，等待Wyckoff確認...';
 
     Object.values(bots).forEach(function(b){
       if(b.cfg&&b.cfg.botRunning)tgBot(b,msg);
