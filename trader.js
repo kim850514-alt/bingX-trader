@@ -5,103 +5,68 @@ const crypto=require('crypto'),https=require('https'),http=require('http'),fs=re
 // 系統設定
 // ══════════════════════════════════
 const ADMIN_CHAT=process.env.TELEGRAM_CHAT_ID||'';
-const ADMIN_TOKEN=process.env.BYBIT_TG_TOKEN||''; // 海馬Bot Token（管理員）
+const ADMIN_TOKEN=process.env.BYBIT_TG_TOKEN||'';
 
-// 共用策略設定（管理員修改，全部用戶同步）
+// 三層設定（只保留基本參數）
 const LAYERS={
-  scalp:{name:'短期',tf:'3m',lev:5,amt:1,threshold:4,maxHold:60,
-    atrMult:{sl:1.5,tp:2.5},limitOffset:0.002},
-  swing:{name:'中期',tf:'5m',lev:5,amt:1,threshold:5,maxHold:360,
-    atrMult:{sl:2.0,tp:3.5},limitOffset:0.003},
-  long: {name:'長期',tf:'1h',lev:5,amt:1,threshold:5,maxHold:2880,
-    atrMult:{sl:2.5,tp:5.0},limitOffset:0.005}
+  scalp:{name:'短期',tf:'3m',lev:5,maxHold:60,atrSl:1.5,atrTp:2.5},
+  swing:{name:'中期',tf:'5m',lev:5,maxHold:360,atrSl:2.0,atrTp:3.5},
+  long: {name:'長期',tf:'1h',lev:5,maxHold:2880,atrSl:2.5,atrTp:5.0}
 };
-const MIN_SL=1.0,MIN_RR=1.5;
-const MAX_SAME_DIR=5;
-const PARAM_LIMITS={
-  oversold:    {min:25, max:35},
-  overbought:  {min:65, max:75},
-  rsiPeriod:   {min:5,  max:14},
-  bbPeriod:    {min:10, max:25},
-  bbStdDev:    {min:1.5,max:2.5},
-  volMultiple: {min:1.0,max:2.0},
-  atrMultSl:   {min:1.5,max:3.0},
-  atrMultTp:   {min:2.0,max:5.0},
-  limitOffset: {min:0.001,max:0.005}
-};
-function clamp(val,key){var l=PARAM_LIMITS[key];if(!l)return val;return Math.min(l.max,Math.max(l.min,val));}
+const MIN_SL=1.0,MIN_RR=1.5,MAX_SAME_DIR=3;
 
 // ══════════════════════════════════
 // 用戶管理
 // ══════════════════════════════════
-var bots=loadBots(); // 所有子Bot資料
+var bots=loadBots();
 function loadBots(){
-  if(fs.existsSync('./bots.json'))try{return JSON.parse(fs.readFileSync('./bots.json','utf8'));}catch(e){}
+  if(fs.existsSync('/home/ubuntu/bots.json'))try{return JSON.parse(fs.readFileSync('/home/ubuntu/bots.json','utf8'));}catch(e){}
   return{};
 }
-function saveBots(){fs.writeFileSync('./bots.json',JSON.stringify(bots,null,2));}
-
-// bots 格式：
-// {
-//   "botToken": {
-//     token: "xxx",
-//     chatId: "xxx",       // 用戶的 chat id
-//     name: "朋友A",
-//     apiKey: "xxx",
-//     secret: "xxx",
-//     cfg: { symbols, botRunning, allowShort, params, amount },
-//     openTrades: {},
-//     stats: {},
-//     lastSignalTs: {},
-//     learnCycleCount: 0,
-//     learningPause: false,
-//     memLog: [],
-//     usedOrderIds: []
-//   }
-// }
-
-function getBot(token){return bots[token]||null;}
-function getBotByChatId(chatId){
-  return Object.values(bots).find(function(b){return b.chatId===chatId;})||null;
-}
+function saveBots(){fs.writeFileSync('/home/ubuntu/bots.json',JSON.stringify(bots,null,2));}
 
 function createBot(token,chatId,name,apiKey,secret){
   bots[token]={
-    token:token,
-    chatId:chatId,
-    name:name||'用戶',
-    apiKey:apiKey,
-    secret:secret,
-    role:'user', // ✅ 角色：user / leader
+    token,chatId,name,apiKey,secret,
+    role:'user',
     cfg:{
-      symbols:['DOGE-USDT','XRP-USDT','SIREN-USDT'],
+      symbols:[],         // 動態更新，由掃描系統決定
       botRunning:false,
       allowShort:true,
       amount:1,
-      copyFrom:null // 跟單哪個leader的token
+      copyFrom:null,
+      layers:{scalp:true,swing:true,long:true} // 各層開關
     },
     openTrades:{},
     stats:{allTime:{total:0,wins:0,losses:0,pnl:0},daily:{},trades:[]},
     lastSignalTs:{},
-    learnCycleCount:0,
-    learningPause:false,
     memLog:[],
-    usedOrderIds:[]
+    usedOrderIds:[],
+    brain:{
+      symbolPerf:{},hourPerf:{},dayPerf:{},
+      layerStats:{
+        scalp:{learnCount:0,trades:[]},
+        swing:{learnCount:0,trades:[]},
+        long:{learnCount:0,trades:[]}
+      },
+      layerParams:{
+        scalp:{oversold:30,overbought:70,bbStdDev:2.0,volMultiple:1.3,atrMultSl:1.5,atrMultTp:2.5},
+        swing:{oversold:30,overbought:70,bbStdDev:2.0,volMultiple:1.3,atrMultSl:2.0,atrMultTp:3.5},
+        long: {oversold:30,overbought:70,bbStdDev:2.5,volMultiple:1.3,atrMultSl:2.5,atrMultTp:5.0}
+      },
+      adjustHistory:[],learnCount:0,
+      bestParamsList:[],locked:false,
+      explorationHistory:[],exploredIdx:0,
+      bestHours:[],worstHours:[]
+    }
   };
   saveBots();
   return bots[token];
 }
 
 // ══════════════════════════════════
-// 共用 Brain（所有用戶共享學習）
+// 工具函數
 // ══════════════════════════════════
-var brain=loadBrain();
-function loadBrain(){
-  if(fs.existsSync('./shared_brain.json'))try{return JSON.parse(fs.readFileSync('./shared_brain.json','utf8'));}catch(e){}
-  return{symbolPerf:{},hourPerf:{},adjustHistory:[],learnCount:0,bestHours:[],worstHours:[],bestSymbols:[],worstSymbols:[]};
-}
-function saveBrain(){fs.writeFileSync('./shared_brain.json',JSON.stringify(brain,null,2));}
-
 function todayKey(){return new Date().toLocaleDateString('zh-TW',{timeZone:'Asia/Taipei'});}
 function nowTW(){return new Date().toLocaleString('zh-TW',{timeZone:'Asia/Taipei'});}
 function hourTW(){return parseInt(new Date().toLocaleString('en-US',{timeZone:'Asia/Taipei',hour:'numeric',hour12:false}));}
@@ -110,9 +75,9 @@ var sysLog=[];
 function log(lv,msg,b){
   var line='['+nowTW()+'][BX]['+lv+'] '+(b?'['+b.name+'] ':'')+msg;
   console.log(line);
-  sysLog.push({ts:nowTW(),lv:lv,msg:msg});
+  sysLog.push({ts:nowTW(),lv,msg});
   if(sysLog.length>300)sysLog.shift();
-  if(b&&b.memLog){b.memLog.push({ts:nowTW(),lv:lv,msg:msg});if(b.memLog.length>100)b.memLog.shift();}
+  if(b&&b.memLog){b.memLog.push({ts:nowTW(),lv,msg});if(b.memLog.length>100)b.memLog.shift();}
 }
 
 // ══════════════════════════════════
@@ -125,14 +90,29 @@ function bxReq(method,path,params,apiKey,secret,tries){
     var qs=Object.keys(p).filter(function(k){return p[k]!=null&&p[k]!=='';}).map(function(k){return k+'='+p[k];}).join('&');
     var sig=crypto.createHmac('sha256',secret).update(qs).digest('hex');
     var q=qs+'&signature='+sig;
-    var opt={hostname:'open-api.bingx.com',path:method==='GET'?path+'?'+q:path,method:method,headers:{'X-BX-APIKEY':apiKey,'Content-Type':'application/x-www-form-urlencoded'}};
+    var opt={hostname:'open-api.bingx.com',path:path+'?'+q,method,headers:{'X-BX-APIKEY':apiKey,'Content-Type':'application/x-www-form-urlencoded'}};
     var go=function(n){
       var req=https.request(opt,function(rsp){var d='';rsp.on('data',function(c){d+=c;});rsp.on('end',function(){try{resolve(JSON.parse(d));}catch(e){reject(new Error(d.slice(0,80)));}});});
       req.on('error',function(e){if(n>1)setTimeout(function(){go(n-1);},2000);else reject(e);});
       req.setTimeout(12000,function(){req.destroy();if(n>1)setTimeout(function(){go(n-1);},2000);else reject(new Error('Timeout'));});
-      if(method==='POST')req.write(q);req.end();
+      req.end();
     };
     go(tries);
+  });
+}
+
+// 公開 API（不需要簽名）
+function bxPublic(path,params){
+  return new Promise(function(resolve,reject){
+    var qs=params?Object.keys(params).map(function(k){return k+'='+params[k];}).join('&'):'';
+    var fullPath=qs?path+'?'+qs:path;
+    var req=https.request({hostname:'open-api.bingx.com',path:fullPath,method:'GET'},function(rsp){
+      var d='';rsp.on('data',function(c){d+=c;});
+      rsp.on('end',function(){try{resolve(JSON.parse(d));}catch(e){reject(e);}});
+    });
+    req.on('error',reject);
+    req.setTimeout(10000,function(){req.destroy();reject(new Error('Timeout'));});
+    req.end();
   });
 }
 
@@ -145,54 +125,82 @@ function api(b){
       throw new Error('Cannot get balance');
     },
     getPositions:async function(sym){
-      sym=sym||'';
       try{var r=await bxReq('GET','/openApi/swap/v2/user/positions',sym?{symbol:sym}:{},ak,sk);if(r.code===0)return(r.data||[]).filter(function(p){return parseFloat(p.positionAmt||0)!==0;});}catch(e){}return[];
     },
     getKlines:async function(sym,tf,lim){
-      lim=lim||150;
+      lim=lim||200;
       var bxTf={'1m':'1m','3m':'3m','5m':'5m','15m':'15m','1h':'1h','4h':'4h'}[tf]||'5m';
       try{var r=await bxReq('GET','/openApi/swap/v2/quote/klines',{symbol:sym,interval:bxTf,limit:lim},ak,sk);if(r.code===0&&Array.isArray(r.data))return r.data;}catch(e){}return[];
     },
     getTicker:async function(sym){
       try{var r=await bxReq('GET','/openApi/swap/v2/quote/ticker',{symbol:sym},ak,sk);if(r.code===0)return r.data;}catch(e){}return null;
     },
+    getFundingRate:async function(sym){
+      try{var r=await bxPublic('/openApi/swap/v2/quote/premiumIndex',{symbol:sym});if(r.code===0&&r.data)return parseFloat(r.data.lastFundingRate||0);}catch(e){}return null;
+    },
+    getOI:async function(sym){
+      try{var r=await bxPublic('/openApi/swap/v2/quote/openInterest',{symbol:sym});if(r.code===0&&r.data)return parseFloat(r.data.openInterest||0);}catch(e){}return null;
+    },
     setLev:async function(sym,lev){
       for(var s of['LONG','SHORT']){try{await bxReq('POST','/openApi/swap/v2/trade/leverage',{symbol:sym,side:s,leverage:lev},ak,sk);}catch(e){}}
     },
-    placeOrder:async function(o){
+    placeLimitOrder:async function(o){
       await this.setLev(o.symbol,o.lev);
       var notional=o.amt*o.lev;
-      var p={symbol:o.symbol,side:o.side,positionSide:o.positionSide,type:'MARKET',quoteOrderQty:String(notional)};
-      var r=await bxReq('POST','/openApi/swap/v2/trade/order',p,ak,sk);
+      var qty=Math.floor(notional/o.limitPrice*100)/100;
+      if(qty*o.limitPrice<5)qty=Math.ceil(5/o.limitPrice*100)/100;
+      if(qty<=0)throw new Error('數量為0');
+      var r=await bxReq('POST','/openApi/swap/v2/trade/order',{
+        symbol:o.symbol,side:o.side,positionSide:o.positionSide,
+        type:'LIMIT',price:String(o.limitPrice),quantity:String(qty),timeInForce:'GTC'
+      },ak,sk);
       if(r.code===0){
-        var ps=o.positionSide,cs=ps==='LONG'?'SELL':'BUY';
-        if(o.stopLoss){try{await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:o.symbol,side:cs,positionSide:ps,type:'STOP_MARKET',stopPrice:String(o.stopLoss),quantity:String(notional/o.price||1),workingType:'MARK_PRICE'},ak,sk);}catch(e){}}
-        if(o.takeProfit){try{await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:o.symbol,side:cs,positionSide:ps,type:'TAKE_PROFIT_MARKET',stopPrice:String(o.takeProfit),quantity:String(notional/o.price||1),workingType:'MARK_PRICE'},ak,sk);}catch(e){}}
-        tgBot(b,'[BingX] ✅ 開單\n'+(o.side==='BUY'?'🟢':'🔴')+' '+o.symbol+' ['+o.layer+']\n保證金:'+o.amt+'U × '+o.lev+'x\nSL:'+o.stopLoss+' TP:'+o.takeProfit);
-        return r.data.order;
-      }else{
-        tgBot(b,'[BingX] ❌ 開單失敗\n'+o.symbol+'\n'+r.msg);
-        return null;
+        // 設定 SL/TP
+        await new Promise(function(res){setTimeout(res,500);});
+        var cs=o.positionSide==='LONG'?'SELL':'BUY';
+        if(o.stopLoss){
+          var slR=await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:o.symbol,side:cs,positionSide:o.positionSide,type:'STOP_MARKET',stopPrice:String(o.stopLoss),quantity:String(qty),workingType:'MARK_PRICE'},ak,sk).catch(function(e){return{code:-1,msg:e.message};});
+          console.log('[SL] '+o.symbol+' code:'+slR.code+' sl:'+o.stopLoss);
+        }
+        if(o.takeProfit){
+          var tpR=await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:o.symbol,side:cs,positionSide:o.positionSide,type:'TAKE_PROFIT_MARKET',stopPrice:String(o.takeProfit),quantity:String(qty),workingType:'MARK_PRICE'},ak,sk).catch(function(e){return{code:-1,msg:e.message};});
+          console.log('[TP] '+o.symbol+' code:'+tpR.code+' tp:'+o.takeProfit);
+        }
+        return{orderId:r.data.order.orderId,qty,price:o.limitPrice};
       }
+      throw new Error('限價單失敗: '+r.msg);
     },
     closePos:async function(sym,ps,qty){
       var r=await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:sym,side:ps==='LONG'?'SELL':'BUY',positionSide:ps,type:'MARKET',quantity:String(qty)},ak,sk);
       return r.code===0?r.data.order:null;
     },
+    cancelOrder:async function(sym,orderId){
+      try{await bxReq('POST','/openApi/swap/v2/trade/cancel',{symbol:sym,orderId},ak,sk);}catch(e){}
+    },
+    cancelAllOrders:async function(sym,ps){
+      try{
+        var r=await bxReq('GET','/openApi/swap/v2/trade/openOrders',{symbol:sym},ak,sk);
+        if(r.code===0&&r.data&&r.data.orders){
+          var toCancel=r.data.orders.filter(function(o){
+            return o.positionSide===ps&&(o.type==='STOP_MARKET'||o.type==='TAKE_PROFIT_MARKET'||o.type==='LIMIT');
+          });
+          for(var i=0;i<toCancel.length;i++){
+            try{await bxReq('POST','/openApi/swap/v2/trade/cancel',{symbol:sym,orderId:toCancel[i].orderId},ak,sk);}catch(e){}
+          }
+          if(toCancel.length>0)log('OK',sym+' 取消 '+toCancel.length+' 個掛單',b);
+        }
+      }catch(e){}
+    },
     getActualPnl:async function(symbol,openTime){
       try{
-        var r=await bxReq('GET','/openApi/swap/v2/trade/allOrders',{symbol:symbol,limit:20},ak,sk);
-        if(r.code===0&&r.data&&r.data.orders){
-          var orders=r.data.orders.filter(function(o){
-            var oTime=parseInt(o.time||o.updateTime||0);
-            var orderId=String(o.orderId||'');
-            var isClose=(o.side==='SELL'&&o.positionSide==='LONG')||(o.side==='BUY'&&o.positionSide==='SHORT');
-            return o.status==='FILLED'&&isClose&&oTime>openTime&&b.usedOrderIds.indexOf(orderId)===-1;
+        var r=await bxReq('GET','/openApi/swap/v2/user/income',{symbol,limit:20,startTime:String(openTime)},ak,sk);
+        if(r.code===0&&r.data&&r.data.length>0){
+          var items=r.data.filter(function(o){
+            return parseInt(o.time||0)>openTime&&(o.incomeType==='REALIZED_PNL'||o.incomeType==='TRADING_FEE');
           });
-          if(orders.length>0){
-            b.usedOrderIds.push(String(orders[0].orderId||''));
-            var pnl=parseFloat(orders[0].profit||0)+parseFloat(orders[0].commission||0);
-            return{pnl:pnl,exitPrice:parseFloat(orders[0].avgPrice||0)};
+          if(items.length>0){
+            var totalPnl=items.reduce(function(sum,o){return sum+parseFloat(o.income||0);},0);
+            return{pnl:totalPnl,exitPrice:0};
           }
         }
       }catch(e){}
@@ -210,10 +218,8 @@ var I={
   rsi:function(a,n){n=n||14;if(a.length<n+1)return null;var g=0,l=0;for(var i=a.length-n;i<a.length;i++){var d=a[i]-a[i-1];if(d>0)g+=d;else l-=d;}return 100-100/(1+g/(l||0.0001));},
   boll:function(a,n,d){n=n||20;d=d||2;if(a.length<n)return null;var sl=a.slice(-n),m=sl.reduce(function(s,v){return s+v;},0)/n,std=Math.sqrt(sl.reduce(function(s,v){return s+Math.pow(v-m,2);},0)/n);return{upper:m+d*std,mid:m,lower:m-d*std};},
   macd:function(a){if(a.length<26)return null;var fast=I.ema(a,12),slow=I.ema(a,26);if(!fast||!slow)return null;return{hist:fast-slow};},
-  // ✅ ATR（平均真實波幅）
   atr:function(highs,lows,closes,n){
-    n=n||14;
-    if(highs.length<n+1)return null;
+    n=n||14;if(highs.length<n+1)return null;
     var trs=[];
     for(var i=1;i<highs.length;i++){
       var tr=Math.max(highs[i]-lows[i],Math.abs(highs[i]-closes[i-1]),Math.abs(lows[i]-closes[i-1]));
@@ -226,143 +232,264 @@ var I={
   }
 };
 
-async function calcSignal(b,ax,sym,layer){
-  var cfg2=LAYERS[layer];
-  var kl=await ax.getKlines(sym,cfg2.tf,210); // 多取K線給EMA200
+// ══════════════════════════════════
+// Wyckoff 分析
+// ══════════════════════════════════
+function analyzeWyckoff(closes,highs,lows,vols){
+  var result={signal:'NONE',pattern:'',strength:0,supportLevel:0,resistanceLevel:0,details:[]};
+  if(closes.length<50)return result;
+
+  var last=closes[closes.length-1];
+  var recentCloses=closes.slice(-20);
+  var recentHighs=highs.slice(-20);
+  var recentLows=lows.slice(-20);
+  var recentVols=vols.slice(-20);
+
+  // 支撐/阻力位
+  var support=Math.min.apply(null,recentLows.slice(0,15));
+  var resistance=Math.max.apply(null,recentHighs.slice(0,15));
+  result.supportLevel=+support.toFixed(6);
+  result.resistanceLevel=+resistance.toFixed(6);
+
+  var range=resistance-support;
+  if(range<=0)return result;
+
+  var avgVol=I.ma(recentVols.slice(0,-1),10)||1;
+  var lastVol=recentVols[recentVols.length-1];
+  var volSpike=lastVol>avgVol*1.5;
+
+  // ✅ 彈簧（Spring）— 假跌破支撐後反彈，做多
+  var prevLow=Math.min.apply(null,recentLows.slice(-5,-1));
+  var currLow=lows[lows.length-1];
+  var currClose=closes[closes.length-1];
+  var prevClose=closes[closes.length-2];
+
+  if(currLow<support&&currClose>support&&currClose>prevClose){
+    var springStrength=0;
+    springStrength+=volSpike?2:1;
+    springStrength+=(currClose-currLow)/(highs[highs.length-1]-currLow)>0.7?2:1;
+    var rsi=I.rsi(closes,14);
+    if(rsi&&rsi<40)springStrength++;
+    result.signal='BUY';
+    result.pattern='彈簧(Spring)';
+    result.strength=springStrength;
+    result.details.push('假跌破支撐'+support.toFixed(4)+'後反彈');
+    if(volSpike)result.details.push('成交量放大確認');
+    return result;
+  }
+
+  // ✅ 向上推力（Upthrust）— 假突破阻力後回落，做空
+  var currHigh=highs[highs.length-1];
+  if(currHigh>resistance&&currClose<resistance&&currClose<prevClose){
+    var utStrength=0;
+    utStrength+=volSpike?2:1;
+    utStrength+=(currHigh-currClose)/(currHigh-lows[lows.length-1])>0.7?2:1;
+    var rsi2=I.rsi(closes,14);
+    if(rsi2&&rsi2>60)utStrength++;
+    result.signal='SELL';
+    result.pattern='向上推力(Upthrust)';
+    result.strength=utStrength;
+    result.details.push('假突破阻力'+resistance.toFixed(4)+'後回落');
+    if(volSpike)result.details.push('成交量放大確認');
+    return result;
+  }
+
+  // ✅ 吸籌確認（Accumulation）— 低位橫盤後放量上漲
+  var priceRange=Math.max.apply(null,recentCloses)-Math.min.apply(null,recentCloses);
+  var isConsolidating=priceRange/last<0.05; // 5% 以內橫盤
+  if(isConsolidating&&last<(support+range*0.3)&&volSpike&&currClose>prevClose){
+    result.signal='BUY';
+    result.pattern='吸籌突破(Accumulation)';
+    result.strength=3;
+    result.details.push('低位橫盤後放量突破');
+    return result;
+  }
+
+  // ✅ 派發確認（Distribution）— 高位橫盤後放量下跌
+  if(isConsolidating&&last>(support+range*0.7)&&volSpike&&currClose<prevClose){
+    result.signal='SELL';
+    result.pattern='派發下跌(Distribution)';
+    result.strength=3;
+    result.details.push('高位橫盤後放量下跌');
+    return result;
+  }
+
+  return result;
+}
+
+// ══════════════════════════════════
+// 數據獵手分析（OI + 資金費率）
+// ══════════════════════════════════
+var oiHistory={}; // 記錄各幣的 OI 歷史
+
+async function analyzeHunter(sym,ax){
+  var result={signal:'NONE',oiTrend:'',fundingBias:'',strength:0,details:[]};
+  try{
+    // 取得當前 OI
+    var currentOI=await ax.getOI(sym);
+    if(!currentOI)return result;
+
+    // 取得資金費率
+    var fr=await ax.getFundingRate(sym);
+
+    // OI 趨勢（與上次比較）
+    var prevOI=oiHistory[sym]||currentOI;
+    var oiChange=(currentOI-prevOI)/prevOI;
+    oiHistory[sym]=currentOI;
+
+    var oiRising=oiChange>0.02;   // OI 上升 >2%
+    var oiFalling=oiChange<-0.02; // OI 下降 >2%
+
+    // 判斷主力方向
+    if(oiRising&&fr!==null){
+      if(fr<0){
+        // OI 上升 + 負資金費率 → 主力開多
+        result.signal='BUY';
+        result.oiTrend='OI↑+'+(oiChange*100).toFixed(1)+'%';
+        result.fundingBias='資金費負('+( fr*100).toFixed(4)+'%)';
+        result.strength+=3;
+        result.details.push('主力開多！OI增加'+(oiChange*100).toFixed(1)+'%');
+        result.details.push('資金費率負值，空方付費給多方');
+      }else if(fr>0){
+        // OI 上升 + 正資金費率 → 主力開空
+        result.signal='SELL';
+        result.oiTrend='OI↑+'+(oiChange*100).toFixed(1)+'%';
+        result.fundingBias='資金費正('+( fr*100).toFixed(4)+'%)';
+        result.strength+=3;
+        result.details.push('主力開空！OI增加'+(oiChange*100).toFixed(1)+'%');
+        result.details.push('資金費率正值，多方付費給空方');
+      }
+    }else if(oiFalling){
+      // OI 下降 → 主力撤資，不開單
+      result.signal='NONE';
+      result.oiTrend='OI↓'+(oiChange*100).toFixed(1)+'%';
+      result.strength=0;
+      result.details.push('主力撤資！OI減少'+(Math.abs(oiChange)*100).toFixed(1)+'%');
+    }else{
+      result.details.push('OI變化:'+(oiChange*100).toFixed(2)+'% 主力觀望');
+    }
+  }catch(e){log('WARN',sym+' Hunter分析失敗: '+e.message);}
+  return result;
+}
+
+// ══════════════════════════════════
+// 全市場掃描（每15分鐘）
+// ══════════════════════════════════
+var marketScanResult={topBuy:[],topSell:[],lastScan:0};
+
+async function scanMarket(){
+  log('INFO','=== 開始全市場掃描 ===');
+  try{
+    // 取得所有合約的 ticker
+    var r=await bxPublic('/openApi/swap/v2/quote/ticker');
+    if(r.code!==0||!r.data)return;
+
+    var tickers=r.data.filter(function(t){
+      return t.symbol&&t.symbol.endsWith('-USDT')&&parseFloat(t.quoteVolume||0)>0;
+    });
+
+    // 按漲幅排序
+    var sorted=tickers.sort(function(a,b){
+      return parseFloat(b.priceChangePercent||0)-parseFloat(a.priceChangePercent||0);
+    });
+
+    // 取漲幅前10（做多候選）和跌幅前10（做空候選）
+    var topGainers=sorted.slice(0,10);
+    var topLosers=sorted.slice(-10).reverse();
+
+    log('INFO','漲幅前3: '+topGainers.slice(0,3).map(function(t){return t.symbol+'('+t.priceChangePercent+'%)';}).join(', '));
+    log('INFO','跌幅前3: '+topLosers.slice(0,3).map(function(t){return t.symbol+'('+t.priceChangePercent+'%)';}).join(', '));
+
+    marketScanResult={
+      topGainers:topGainers,
+      topLosers:topLosers,
+      lastScan:Date.now(),
+      allTickers:tickers
+    };
+
+    // 廣播掃描結果給所有運行中的用戶
+    var msg='📊 全市場掃描完成\n\n漲幅前3:\n';
+    topGainers.slice(0,3).forEach(function(t,i){
+      msg+=(i+1)+'名 '+t.symbol+' +'+parseFloat(t.priceChangePercent).toFixed(2)+'%\n';
+    });
+    msg+='\n跌幅前3:\n';
+    topLosers.slice(0,3).forEach(function(t,i){
+      msg+=(i+1)+'名 '+t.symbol+' '+parseFloat(t.priceChangePercent).toFixed(2)+'%\n';
+    });
+
+    Object.values(bots).forEach(function(b){
+      if(b.cfg&&b.cfg.botRunning)tgBot(b,msg);
+    });
+
+  }catch(e){log('ERROR','市場掃描失敗: '+e.message);}
+}
+
+// ══════════════════════════════════
+// 雙重確認信號（Wyckoff + Hunter）
+// ══════════════════════════════════
+async function analyzeSignal(b,ax,sym,layer,rankInfo){
+  var layerCfg=LAYERS[layer];
+  var kl=await ax.getKlines(sym,layerCfg.tf,200);
   if(kl.length<60)return null;
+
   var closes=kl.map(function(k){return parseFloat(k.close||k[4]||0);});
   var highs=kl.map(function(k){return parseFloat(k.high||k[2]||0);});
   var lows=kl.map(function(k){return parseFloat(k.low||k[3]||0);});
   var vols=kl.map(function(k){return parseFloat(k.volume||k[5]||0);});
   var last=closes[closes.length-1];
-  var p={
-    rsiPeriod:clamp(7,'rsiPeriod'),
-    oversold:clamp(30,'oversold'),
-    overbought:clamp(70,'overbought'),
-    volMultiple:clamp(1.3,'volMultiple'),
-    bbPeriod:clamp(15,'bbPeriod'),
-    bbStdDev:clamp(2,'bbStdDev')
-  };
-  var bs=0,ss=0,rsn=[];
 
-  // RSI
-  var rsi=I.rsi(closes,p.rsiPeriod),rsiPrev=I.rsi(closes.slice(0,-1),p.rsiPeriod);
-  if(rsi!==null&&rsiPrev!==null){
-    if(rsiPrev<p.oversold&&rsi>p.oversold){bs+=3;rsn.push('RSI回升('+rsi.toFixed(0)+')');}
-    if(rsiPrev>p.overbought&&rsi<p.overbought){ss+=3;rsn.push('RSI回落('+rsi.toFixed(0)+')');}
-    if(rsi<50){bs+=1;}else{ss+=1;}
-  }
+  // Wyckoff 分析
+  var wyckoff=analyzeWyckoff(closes,highs,lows,vols);
 
-  // BB
-  var bb=I.boll(closes,p.bbPeriod,p.bbStdDev);
-  if(bb){
-    if(last<bb.lower){bs+=2;rsn.push('BB下軌');}else if(last<bb.mid){bs+=1;rsn.push('BB下半');}
-    if(last>bb.upper){ss+=2;rsn.push('BB上軌');}else if(last>bb.mid){ss+=1;rsn.push('BB上半');}
-  }
+  // 數據獵手分析
+  var hunter=await analyzeHunter(sym,ax);
 
-  // EMA9/21 短期動能
-  var ema9=I.ema(closes,9),ema21=I.ema(closes,21);
-  if(ema9&&ema21){
-    if(ema9>ema21){bs+=1;rsn.push('EMA多');}else{ss+=1;rsn.push('EMA空');}
-  }
+  // ATR 計算
+  var atrVal=I.atr(highs,lows,closes,14)||last*0.01;
 
-  // ✅ EMA50/200 趨勢過濾（所有層都加入）
-  var ema50=I.ema(closes,50);
-  var ema200=I.ema(closes,Math.min(200,closes.length-1));
-  if(ema50&&ema200){
-    if(ema50>ema200){bs+=2;rsn.push('趨勢多');}else{ss+=2;rsn.push('趨勢空');}
-    // 逆勢扣分
-    if(ema50>ema200&&ss>bs){ss=Math.max(0,ss-1);}
-    if(ema50<ema200&&bs>ss){bs=Math.max(0,bs-1);}
-  }
+  // 各層獨立參數
+  var lp=(b.brain&&b.brain.layerParams&&b.brain.layerParams[layer])||LAYERS[layer];
 
-  // MACD
-  var macdData=I.macd(closes);
-  if(macdData){if(macdData.hist>0){bs+=1;rsn.push('MACD+');}else{ss+=1;rsn.push('MACD-');}}
-
-  // 成交量
-  var avgVol=I.ma(vols.slice(0,-1),20);
-  if(avgVol&&vols[vols.length-1]>avgVol*p.volMultiple){bs+=1;ss+=1;rsn.push('量增');}
-
-  // ✅ ATR 計算
-  var atrVal=I.atr(highs,lows,closes,14);
-
-  var threshold=cfg2.threshold;
+  // ✅ 雙重確認：Wyckoff 和 Hunter 方向一致才開單
   var signal='HOLD';
-  if(bs>=threshold&&bs>ss)signal='BUY';
-  else if(ss>=threshold&&ss>bs)signal='SELL';
+  var signalDetails=[];
 
-  log('INFO',sym+' ['+layer+'] BS:'+bs+' SS:'+ss+' 門檻:'+threshold+' -> '+signal+(rsn.length?' ['+rsn.join('+')+']':''),b);
-  return{signal:signal,bs:bs,ss:ss,reasons:rsn.join('+'),price:last,atr:atrVal,highs:highs,lows:lows,closes:closes};
-}
-// 統計
-// ══════════════════════════════════
-function recordTrade(b,t){
-  var today=todayKey();
-  if(!b.stats.daily[today])b.stats.daily[today]={total:0,wins:0,losses:0,pnl:0};
-  var d=b.stats.daily[today];
-  d.total++;if(t.pnl>0)d.wins++;else d.losses++;d.pnl+=t.pnl;
-  b.stats.allTime.total++;if(t.pnl>0)b.stats.allTime.wins++;else b.stats.allTime.losses++;b.stats.allTime.pnl+=t.pnl;
-  b.stats.trades.push(Object.assign({},t,{date:today}));
-  if(b.stats.trades.length>500)b.stats.trades=b.stats.trades.slice(-500);
-  // 共享學習
-  brain.learnCount=(brain.learnCount||0)+1;
-  if(!brain.symbolPerf[t.symbol])brain.symbolPerf[t.symbol]={wins:0,losses:0,pnl:0,count:0};
-  var sp=brain.symbolPerf[t.symbol];
-  if(t.pnl>0)sp.wins++;else sp.losses++;sp.pnl+=t.pnl;sp.count++;
-  var hr=String(hourTW());
-  if(!brain.hourPerf[hr])brain.hourPerf[hr]={wins:0,losses:0,pnl:0};
-  if(t.pnl>0)brain.hourPerf[hr].wins++;else brain.hourPerf[hr].losses++;brain.hourPerf[hr].pnl+=t.pnl;
-  saveBrain();
-  // 學習週期
-  b.learnCycleCount++;
-  if(b.learnCycleCount>=3){
-    b.learnCycleCount=0;
-    tgBot(b,'[BingX 🧠] 已完成3筆交易，學習中...');
+  if(wyckoff.signal!=='NONE'&&hunter.signal!=='NONE'&&wyckoff.signal===hunter.signal){
+    signal=wyckoff.signal;
+    signalDetails.push('✅ 雙重確認一致！');
+    signalDetails.push('📐 Wyckoff: '+wyckoff.pattern+' (強度:'+wyckoff.strength+')');
+    signalDetails.push(wyckoff.details.join(' | '));
+    signalDetails.push('🐋 數據獵手: '+hunter.details.join(' | '));
+    if(rankInfo)signalDetails.push('📊 '+rankInfo);
+  }else if(wyckoff.signal!=='NONE'&&hunter.signal==='NONE'){
+    // Hunter 觀望，只有 Wyckoff 訊號，不開單
+    log('INFO',sym+' ['+layer+'] Wyckoff:'+wyckoff.signal+' Hunter:觀望 → HOLD',b);
+  }else if(wyckoff.signal==='NONE'&&hunter.signal!=='NONE'){
+    // 只有 Hunter 訊號，不開單
+    log('INFO',sym+' ['+layer+'] Wyckoff:無訊號 Hunter:'+hunter.signal+' → HOLD',b);
+  }else if(wyckoff.signal!=='NONE'&&hunter.signal!=='NONE'&&wyckoff.signal!==hunter.signal){
+    // 訊號相反，不開單
+    log('INFO',sym+' ['+layer+'] 訊號矛盾 Wyckoff:'+wyckoff.signal+' Hunter:'+hunter.signal+' → HOLD',b);
   }
-  saveBots();
+
+  log('INFO',sym+' ['+layer+'] Wyckoff:'+wyckoff.signal+'('+wyckoff.pattern+') Hunter:'+hunter.signal+' → '+signal,b);
+
+  return{
+    signal,
+    wyckoff,
+    hunter,
+    atr:atrVal,
+    price:last,
+    support:wyckoff.supportLevel,
+    resistance:wyckoff.resistanceLevel,
+    signalDetails,
+    lp
+  };
 }
 
 // ══════════════════════════════════
 // 持倉監控
 // ══════════════════════════════════
-async function checkPendingOrders(b){
-  var ax=api(b);
-  if(!b.pendingOrders)b.pendingOrders={};
-  for(var key in b.pendingOrders){
-    try{
-      var po=b.pendingOrders[key];
-      var holdMin=Math.round((Date.now()-po.openTime)/60000);
-      // 超過 30 分鐘未成交取消
-      if(holdMin>30){
-        try{await bxReq('POST','/openApi/swap/v2/trade/cancel',{symbol:po.symbol,orderId:po.orderId},b.apiKey,b.secret);}catch(e){}
-        delete b.pendingOrders[key];
-        saveBots();
-        log('INFO',po.symbol+' ['+po.layer+'] 限價單超時取消',b);
-        tgBot(b,'[BingX] ⏰ 限價單取消\n'+po.symbol+' ['+po.layerName+']\n掛了 '+holdMin+' 分鐘未成交');
-        continue;
-      }
-      // 檢查訂單狀態
-      try{
-        var r=await bxReq('GET','/openApi/swap/v2/trade/orderDetail',{symbol:po.symbol,orderId:po.orderId},b.apiKey,b.secret);
-        if(r.code===0&&r.data&&r.data.order&&r.data.order.status==='FILLED'){
-          log('OK',po.symbol+' ['+po.layer+'] 限價單已成交！',b);
-          var tradeKey=po.symbol+'_'+po.layer+'_'+(po.positionSide==='LONG'?'L':'S');
-          b.openTrades[tradeKey]={
-            symbol:po.symbol,side:po.positionSide,
-            entry:po.limitPrice,qty:po.qty,
-            layer:po.layer,openTime:Date.now(),
-            halfExited:false,slMoved:false
-          };
-          delete b.pendingOrders[key];
-          saveBots();
-          tgBot(b,'[BingX] ✅ 限價單成交！\n'+(po.positionSide==='LONG'?'🟢':'🔴')+' '+po.symbol+' ['+po.layerName+']\n成交價: '+po.limitPrice+'\nSL: '+po.stopLoss+' TP: '+po.takeProfit);
-        }
-      }catch(e){}
-    }catch(e){log('ERROR','checkPending: '+e.message,b);}
-  }
-}
-
 async function checkPositions(b){
   var ax=api(b);
   for(var key in b.openTrades){
@@ -373,185 +500,189 @@ async function checkPositions(b){
       var cur=parseFloat(tk.lastPrice);
       var holdMin=Math.round((Date.now()-t.openTime)/60000);
       var ps=t.side;
+
+      // 檢查是否已平倉
       var pos=await ax.getPositions(t.symbol);
       var stillOpen=pos.some(function(p){return p.positionSide===ps&&parseFloat(p.positionAmt||0)!==0;});
+
       if(!stillOpen&&holdMin>1){
-        await new Promise(function(r){setTimeout(r,1500);});
+        await new Promise(function(res){setTimeout(res,1500);});
         var actual=await ax.getActualPnl(t.symbol,t.openTime);
         var pnl=actual?actual.pnl:0;
-        var source=actual?'API':'估算';
-        recordTrade(b,{symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:pnl,holdMin:holdMin,reason:'TP/SL',layer:layer});
+        recordTrade(b,{symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl,holdMin,reason:'TP/SL',layer});
         delete b.openTrades[key];
-        saveBots();
-        tgBot(b,'[BingX] '+(pnl>=0?'✅':'❌')+' '+t.symbol+' ['+layerCfg.name+']\nPnL('+source+'):'+(pnl>=0?'+':'')+pnl.toFixed(4)+'U Hold:'+holdMin+'min');
+        await ax.cancelAllOrders(t.symbol,ps);
+        tgBot(b,'[BingX] '+(pnl>=0?'✅':'❌')+' '+t.symbol+' ['+layerCfg.name+']\nPnL:'+(pnl>=0?'+':'')+pnl.toFixed(4)+'U Hold:'+holdMin+'min');
         continue;
       }
-      var estPnl=ps==='LONG'?(cur-t.entry)*t.qty*layerCfg.lev:(t.entry-cur)*t.qty*layerCfg.lev;
+
+      var estPnl=ps==='LONG'?(cur-t.entry)*t.qty:(t.entry-cur)*t.qty;
       var estPct=ps==='LONG'?(cur-t.entry)/t.entry*100:(t.entry-cur)/t.entry*100;
       log('INFO','持倉 '+t.symbol+' ['+layer+'] '+(estPct>=0?'+':'')+estPct.toFixed(2)+'% Hold:'+holdMin+'min',b);
 
-      // ✅ 移動止損：達到 TP1 時 SL 移到開倉價和 TP1 中間
-      var tpPct=layerCfg.atrMult?layerCfg.atrMult.tp:Math.max(MIN_SL*MIN_RR,3);
-      var tp1Pct=tpPct*0.5;
+      // 移動止損：達到 TP1 時 SL 移到開倉價和 TP1 中間
+      var tp1Pct=(layerCfg.atrTp*0.5);
       if(estPct>=tp1Pct&&!t.slMoved){
         t.slMoved=true;
         var tp1Price=ps==='LONG'?t.entry*(1+tp1Pct/100):t.entry*(1-tp1Pct/100);
-        var newSl=+((t.entry+tp1Price)/2).toFixed(4);
+        var newSl=+((t.entry+tp1Price)/2).toFixed(6);
         try{
           await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:t.symbol,side:ps==='LONG'?'SELL':'BUY',positionSide:ps,type:'STOP_MARKET',stopPrice:String(newSl),quantity:String(t.qty),workingType:'MARK_PRICE'},b.apiKey,b.secret);
-          tgBot(b,'[BingX] 🔒 止損上移\n'+t.symbol+' ['+layerCfg.name+']\n新止損: '+newSl+'\n鎖定約 '+(tp1Pct*0.5).toFixed(2)+'% 獲利');
+          tgBot(b,'[BingX] 🔒 止損上移\n'+t.symbol+' ['+layerCfg.name+']\n新止損: '+newSl);
         }catch(e){}
       }
 
-      // ✅ 分倉出場：達到 TP1 平一半
-      if(estPct>=tp1Pct&&!t.halfExited&&stillOpen){
-        t.halfExited=true;
-        var halfQty=Math.floor(t.qty/2*100)/100;
-        if(halfQty>0){
-          try{
-            await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:t.symbol,side:ps==='LONG'?'SELL':'BUY',positionSide:ps,type:'MARKET',quantity:String(halfQty)},b.apiKey,b.secret);
-            log('AI',t.symbol+' 半倉出場 qty='+halfQty,b);
-            tgBot(b,'[BingX] 🏁 半倉出場\n'+t.symbol+' ['+layerCfg.name+']\n數量: '+halfQty+'\n獲利: +'+estPct.toFixed(2)+'%');
-          }catch(e){log('WARN',t.symbol+' 半倉失敗: '+e.message,b);}
-        }
-      }
-
-      // 反向訊號
-      if(holdMin>=5&&stillOpen){
-        var res=await calcSignal(b,ax,t.symbol,layer).catch(function(){return null;});
-        if(res){
-          var rev=(ps==='LONG'&&res.signal==='SELL')||(ps==='SHORT'&&res.signal==='BUY');
-          if(rev){
-            var o=await ax.closePos(t.symbol,ps,t.qty).catch(function(){return null;});
-            if(o){
-              await new Promise(function(r3){setTimeout(r3,1500);});
-              var a3=await ax.getActualPnl(t.symbol,t.openTime);
-              var p3=a3?a3.pnl:estPnl;
-              recordTrade(b,{symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:p3,holdMin:holdMin,reason:'反向平倉',layer:layer});
-              delete b.openTrades[key];
-              saveBots();
-              tgBot(b,'[BingX] 🔄 反向平倉\n'+t.symbol+' ['+layerCfg.name+']\nPnL:'+(p3>=0?'✅ +':'❌ ')+p3.toFixed(4)+'U Hold:'+holdMin+'min');
-              continue;
-            }
-          }
-        }
-      }
-      // 超時
+      // 超時平倉
       if(holdMin>=layerCfg.maxHold){
         var o2=await ax.closePos(t.symbol,ps,t.qty).catch(function(){return null;});
         if(o2){
-          await new Promise(function(r4){setTimeout(r4,1500);});
-          var a4=await ax.getActualPnl(t.symbol,t.openTime);
-          var p4=a4?a4.pnl:estPnl;
-          recordTrade(b,{symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:p4,holdMin:holdMin,reason:'超時平倉',layer:layer});
+          await new Promise(function(r3){setTimeout(r3,1500);});
+          var a3=await ax.getActualPnl(t.symbol,t.openTime);
+          var p3=a3?a3.pnl:estPnl;
+          recordTrade(b,{symbol:t.symbol,side:t.side,entry:t.entry,exit:cur,qty:t.qty,pnl:p3,holdMin,reason:'超時平倉',layer});
           delete b.openTrades[key];
-          tgBot(b,'[BingX] ⏰ 超時\n'+t.symbol+' ['+layerCfg.name+']\nPnL:'+(p4>=0?'✅ +':'❌ ')+p4.toFixed(4)+'U Hold:'+holdMin+'min');
+          await ax.cancelAllOrders(t.symbol,ps);
+          tgBot(b,'[BingX] ⏰ 超時\n'+t.symbol+' ['+layerCfg.name+']\nPnL:'+(p3>=0?'✅ +':'❌ ')+p3.toFixed(4)+'U Hold:'+holdMin+'min');
         }
       }
+
+      // 掛單超時取消（限價單超30分鐘未成交）
+      if(t.isPending&&holdMin>30){
+        await ax.cancelOrder(t.symbol,t.orderId);
+        delete b.openTrades[key];
+        log('INFO',t.symbol+' 限價掛單超時取消',b);
+        tgBot(b,'[BingX] ⏰ 限價單取消\n'+t.symbol+'\n掛了'+holdMin+'分鐘未成交');
+      }
+
     }catch(e){log('ERROR','checkPos: '+e.message,b);}
   }
 }
 
 // ══════════════════════════════════
-// 交易循環
+// 主交易循環
 // ══════════════════════════════════
-async function tradingLoop(b){
+async function tradingLoopUser(b){
   if(!b.cfg.botRunning)return;
-  if(b.learningPause){await checkPendingOrders(b);await checkPositions(b);return;}
   var ax=api(b);
-  if(!b.pendingOrders)b.pendingOrders={};
   try{
     var bal=await ax.getBalance().catch(function(){return null;});
     if(!bal)return;
     var amt=b.cfg.amount||1;
 
-    // 先檢查掛單
-    await checkPendingOrders(b);
+    // 從掃描結果取候選幣種
+    var candidates=[];
+    if(marketScanResult.topGainers){
+      // 漲幅前3（做多候選）
+      marketScanResult.topGainers.slice(0,3).forEach(function(t,i){
+        candidates.push({symbol:t.symbol,direction:'BUY',rank:i+1,changePercent:parseFloat(t.priceChangePercent)});
+      });
+      // 跌幅前3（做空候選）
+      if(b.cfg.allowShort){
+        marketScanResult.topLosers.slice(0,3).forEach(function(t,i){
+          candidates.push({symbol:t.symbol,direction:'SELL',rank:i+1,changePercent:parseFloat(t.priceChangePercent)});
+        });
+      }
+    }
 
-    for(var i=0;i<b.cfg.symbols.length;i++){
-      var sym=b.cfg.symbols[i];
+    for(var i=0;i<candidates.length;i++){
+      var cand=candidates[i];
+      var sym=cand.symbol;
       for(var layerName in LAYERS){
         try{
+          if(!b.cfg.layers[layerName])continue;
           var layerCfg=LAYERS[layerName];
-          // 同層同幣只能一個方向（包含掛單）
-          var hasL=b.openTrades[sym+'_'+layerName+'_L']||b.pendingOrders[sym+'_'+layerName+'_L'];
-          var hasS=b.openTrades[sym+'_'+layerName+'_S']||b.pendingOrders[sym+'_'+layerName+'_S'];
-          if(hasL||hasS)continue;
 
+          // 同幣種方向檢查
+          var symHasLong=Object.keys(b.openTrades).some(function(k){return k.startsWith(sym+'_')&&k.endsWith('_L');});
+          var symHasShort=Object.keys(b.openTrades).some(function(k){return k.startsWith(sym+'_')&&k.endsWith('_S');});
+          var hasL=b.openTrades[sym+'_'+layerName+'_L'];
+          var hasS=b.openTrades[sym+'_'+layerName+'_S'];
+          if(hasL||hasS)continue;
+          if(cand.direction==='BUY'&&symHasShort)continue;
+          if(cand.direction==='SELL'&&symHasLong)continue;
+
+          // 冷卻時間
           var coolKey=sym+'_'+layerName+'_cool';
           if(b.lastSignalTs[coolKey]&&(Date.now()-b.lastSignalTs[coolKey])<300000)continue;
 
-          var res=await calcSignal(b,ax,sym,layerName);
-          if(!res||res.signal==='HOLD')continue;
-
-          // 同方向最多5張
-          var dirKey=res.signal==='BUY'?'_L':'_S';
-          var sameDir=Object.keys(b.openTrades).filter(function(k){return k.endsWith(dirKey);}).length+
-                      Object.keys(b.pendingOrders).filter(function(k){return k.endsWith(dirKey);}).length;
-          if(sameDir>=MAX_SAME_DIR){log('INFO',sym+' ['+layerName+'] 同方向達上限',b);continue;}
+          // 同方向最多3張
+          var dirKey=cand.direction==='BUY'?'_L':'_S';
+          var sameDir=Object.keys(b.openTrades).filter(function(k){return k.endsWith(dirKey);}).length;
+          if(sameDir>=MAX_SAME_DIR)continue;
 
           if(bal.available<amt)continue;
+
+          // 排名資訊
+          var rankInfo=(cand.direction==='BUY'?'漲幅':'跌幅')+'第'+cand.rank+'名 '+cand.changePercent.toFixed(2)+'%';
+
+          // 雙重確認分析
+          var res=await analyzeSignal(b,ax,sym,layerName,rankInfo);
+          if(!res||res.signal==='HOLD')continue;
+          if(res.signal!==cand.direction)continue; // 方向不一致跳過
+
           var cur=res.price;
           if(!cur||isNaN(cur))continue;
 
-          // ✅ ATR 動態止損止盈
-          var atrVal=res.atr||cur*0.01;
-          var slDist=Math.max(atrVal*layerCfg.atrMult.sl,cur*MIN_SL/100);
-          var tpDist=Math.max(atrVal*layerCfg.atrMult.tp,slDist*MIN_RR);
-          var slP,tpP,limitPrice;
+          // ATR 動態止損止盈
+          var lp=res.lp;
+          var atrSl=lp.atrMultSl||layerCfg.atrSl;
+          var atrTp=lp.atrMultTp||layerCfg.atrTp;
+          var slDist=Math.max(res.atr*atrSl,cur*MIN_SL/100);
+          var tpDist=Math.max(res.atr*atrTp,slDist*MIN_RR);
 
+          var slP,tpP,limitPrice;
           if(res.signal==='BUY'){
             slP=+(cur-slDist).toFixed(6);
             tpP=+(cur+tpDist).toFixed(6);
-            limitPrice=+(cur*(1-layerCfg.limitOffset)).toFixed(6);
+            // 限價買在支撐附近
+            limitPrice=res.support>0&&res.support>cur*0.98?+(res.support*1.001).toFixed(6):+(cur*0.998).toFixed(6);
           }else{
             slP=+(cur+slDist).toFixed(6);
             tpP=+(cur-tpDist).toFixed(6);
-            limitPrice=+(cur*(1+layerCfg.limitOffset)).toFixed(6);
+            // 限價賣在阻力附近
+            limitPrice=res.resistance>0&&res.resistance<cur*1.02?+(res.resistance*0.999).toFixed(6):+(cur*1.002).toFixed(6);
           }
 
           var positionSide=res.signal==='BUY'?'LONG':'SHORT';
           var tradeKey=sym+'_'+layerName+'_'+(res.signal==='BUY'?'L':'S');
 
-          if(res.signal==='BUY'||(res.signal==='SELL'&&b.cfg.allowShort)){
-            // ✅ 限價掛單
-            var notional=amt*layerCfg.lev;
-            var qty=Math.floor(notional/cur*100)/100;
-            if(qty*cur<5)qty=Math.ceil(5/cur*100)/100;
-            if(qty<=0){log('WARN',sym+' 數量為0',b);continue;}
+          // 限價掛單
+          var lo=await ax.placeLimitOrder({
+            symbol:sym,side:res.signal==='BUY'?'BUY':'SELL',
+            positionSide,amt,lev:layerCfg.lev,
+            limitPrice,stopLoss:slP,takeProfit:tpP
+          }).catch(function(e){log('ERROR',sym+' 掛單失敗: '+e.message,b);return null;});
 
-            try{
-              await bxReq('POST','/openApi/swap/v2/trade/leverage',{symbol:sym,side:positionSide,leverage:layerCfg.lev},b.apiKey,b.secret);
-            }catch(e){}
+          if(lo){
+            b.lastSignalTs[coolKey]=Date.now();
+            b.openTrades[tradeKey]={
+              symbol:sym,side:positionSide,
+              entry:limitPrice,qty:lo.qty,
+              layer:layerName,openTime:Date.now(),
+              orderId:lo.orderId,isPending:true,
+              halfExited:false,slMoved:false,
+              stopLoss:slP,takeProfit:tpP
+            };
+            saveBots();
 
-            var limitOrder=await bxReq('POST','/openApi/swap/v2/trade/order',{
-              symbol:sym,
-              side:res.signal==='BUY'?'BUY':'SELL',
-              positionSide:positionSide,
-              type:'LIMIT',
-              price:String(limitPrice),
-              quantity:String(qty),
-              timeInForce:'GTC'
-            },b.apiKey,b.secret);
+            // 開單通知
+            var notif='[BingX] 📋 限價掛單\n';
+            notif+=(res.signal==='BUY'?'🟢 多':'🔴 空')+' '+sym+' ['+layerCfg.name+']\n';
+            notif+='📊 '+rankInfo+'\n';
+            notif+='限價: '+limitPrice+'\n';
+            notif+='SL: '+slP+' TP: '+tpP+'\n\n';
+            notif+='📐 Wyckoff: '+res.wyckoff.pattern+'\n';
+            res.wyckoff.details.forEach(function(d){notif+='  '+d+'\n';});
+            notif+='\n🐋 數據獵手:\n';
+            res.hunter.details.forEach(function(d){notif+='  '+d+'\n';});
+            if(res.hunter.oiTrend)notif+='OI: '+res.hunter.oiTrend+'\n';
+            if(res.hunter.fundingBias)notif+=res.hunter.fundingBias+'\n';
 
-            if(limitOrder&&limitOrder.code===0){
-              b.lastSignalTs[coolKey]=Date.now();
-              b.pendingOrders[tradeKey]={
-                symbol:sym,positionSide:positionSide,
-                layer:layerName,layerName:layerCfg.name,
-                orderId:limitOrder.data.order.orderId,
-                qty:qty,limitPrice:limitPrice,
-                stopLoss:slP,takeProfit:tpP,
-                openTime:Date.now()
-              };
-              saveBots();
-              log('OK',sym+' ['+layerName+'] 限價掛單 @'+limitPrice+' SL:'+slP+' TP:'+tpP,b);
-              tgBot(b,'[BingX] 📋 限價掛單\n'+(res.signal==='BUY'?'🟢 多':'🔴 空')+' '+sym+' ['+layerCfg.name+']\n掛單價: '+limitPrice+'\nSL: '+slP+'\nTP: '+tpP+'\n(ATR×'+layerCfg.atrMult.sl+'/'+layerCfg.atrMult.tp+')');
-              // 觸發帶單
-              copyTrade(b,{symbol:sym,side:res.signal==='BUY'?'BUY':'SELL',positionSide:positionSide,price:limitPrice,stopLoss:slP,takeProfit:tpP,layer:layerName}).catch(function(){});
-            }else{
-              log('ERROR',sym+' 限價掛單失敗: '+(limitOrder?limitOrder.msg:'null'),b);
-            }
+            tgBot(b,notif);
+            log('OK',sym+' ['+layerName+'] 限價掛單 @'+limitPrice+' SL:'+slP+' TP:'+tpP,b);
+
+            // 帶單跟單
+            copyTrade(b,{symbol:sym,side:res.signal==='BUY'?'BUY':'SELL',positionSide,price:limitPrice,stopLoss:slP,takeProfit:tpP,layer:layerName}).catch(function(){});
           }
         }catch(e){log('ERROR',sym+' ['+layerName+']: '+e.message,b);}
       }
@@ -561,107 +692,136 @@ async function tradingLoop(b){
 }
 
 // ══════════════════════════════════
-// 主循環（每分鐘掃描所有Bot）
+// 統計與學習
 // ══════════════════════════════════
-// ══════════════════════════════════
-// 持倉恢復
-// ══════════════════════════════════
-async function recoverPositions(b){
-  try{
-    var ax=api(b);
-    var pos=await ax.getPositions();
-    if(!pos||pos.length===0)return;
-    var recovered=0;
-    for(var i=0;i<pos.length;i++){
-      var p=pos[i];
-      var amt=parseFloat(p.positionAmt||0);
-      if(amt===0)continue;
-      var sym=p.symbol;
-      var side=p.positionSide||'LONG';
-      var key=sym+'_swing_'+(side==='LONG'?'L':'S');
-      if(b.openTrades[key])continue;
-      b.openTrades[key]={symbol:sym,side:side,entry:parseFloat(p.avgPrice||0),qty:Math.abs(amt),layer:'swing',openTime:Date.now()-30*60000};
-      recovered++;
-      log('INFO','恢復持倉: '+sym+' '+side,b);
-    }
-    if(recovered>0){
-      saveBots();
-      tgBot(b,'[BingX] 🔄 恢復 '+recovered+' 個持倉');
-    }
-  }catch(e){log('WARN','recoverPositions: '+e.message,b);}
+function recordTrade(b,t){
+  var today=todayKey();
+  if(!b.stats.daily[today])b.stats.daily[today]={total:0,wins:0,losses:0,pnl:0};
+  var d=b.stats.daily[today];
+  d.total++;if(t.pnl>0)d.wins++;else d.losses++;d.pnl+=t.pnl;
+  b.stats.allTime.total++;if(t.pnl>0)b.stats.allTime.wins++;else b.stats.allTime.losses++;b.stats.allTime.pnl+=t.pnl;
+  b.stats.trades.push(Object.assign({},t,{date:today}));
+  if(b.stats.trades.length>500)b.stats.trades=b.stats.trades.slice(-500);
+  if(!b.brain)b.brain={symbolPerf:{},hourPerf:{},dayPerf:{},adjustHistory:[],learnCount:0,layerStats:{scalp:{learnCount:0,trades:[]},swing:{learnCount:0,trades:[]},long:{learnCount:0,trades:[]}},layerParams:{scalp:{oversold:30,overbought:70,bbStdDev:2.0,volMultiple:1.3,atrMultSl:1.5,atrMultTp:2.5},swing:{oversold:30,overbought:70,bbStdDev:2.0,volMultiple:1.3,atrMultSl:2.0,atrMultTp:3.5},long:{oversold:30,overbought:70,bbStdDev:2.5,volMultiple:1.3,atrMultSl:2.5,atrMultTp:5.0}},bestParamsList:[],locked:false,explorationHistory:[],exploredIdx:0};
+  b.brain.learnCount=(b.brain.learnCount||0)+1;
+  if(b.brain.learnCount%25===0)autoAdjust(b);
+  var tLayer=t.layer||'swing';
+  if(!b.brain.layerStats[tLayer])b.brain.layerStats[tLayer]={learnCount:0,trades:[]};
+  b.brain.layerStats[tLayer].trades.push({pnl:t.pnl,date:today});
+  if(b.brain.layerStats[tLayer].trades.length>100)b.brain.layerStats[tLayer].trades=b.brain.layerStats[tLayer].trades.slice(-100);
+  b.brain.layerStats[tLayer].learnCount++;
+  if(b.brain.layerStats[tLayer].learnCount%25===0)autoAdjustLayer(b,tLayer);
+  var hr=String(hourTW());
+  if(!b.brain.hourPerf)b.brain.hourPerf={};
+  if(!b.brain.hourPerf[hr])b.brain.hourPerf[hr]={wins:0,losses:0,pnl:0};
+  if(t.pnl>0)b.brain.hourPerf[hr].wins++;else b.brain.hourPerf[hr].losses++;
+  b.brain.hourPerf[hr].pnl+=t.pnl;
+  var curDay=new Date().toLocaleString('en-US',{timeZone:'Asia/Taipei',weekday:'short'});
+  if(!b.brain.dayPerf)b.brain.dayPerf={};
+  if(!b.brain.dayPerf[curDay])b.brain.dayPerf[curDay]={wins:0,losses:0,pnl:0};
+  if(t.pnl>0)b.brain.dayPerf[curDay].wins++;else b.brain.dayPerf[curDay].losses++;
+  b.brain.dayPerf[curDay].pnl+=t.pnl;
+  if(!b.brain.symbolPerf[t.symbol])b.brain.symbolPerf[t.symbol]={wins:0,losses:0,pnl:0,count:0};
+  var sp=b.brain.symbolPerf[t.symbol];
+  if(t.pnl>0)sp.wins++;else sp.losses++;sp.pnl+=t.pnl;sp.count++;
+  saveBots();
+}
+
+function autoAdjustLayer(b,layer){
+  if(!b.brain.layerStats||!b.brain.layerStats[layer])return;
+  var trades=b.brain.layerStats[layer].trades;
+  if(trades.length<10)return;
+  var wins=trades.filter(function(t){return t.pnl>0;});
+  var wr=wins.length/trades.length;
+  var layerCfg=LAYERS[layer];
+  var changes=[];
+  if(!b.cfg.layers)b.cfg.layers={};
+  if(!b.cfg.layerParams)b.cfg.layerParams={};
+  if(!b.cfg.layerParams[layer])b.cfg.layerParams[layer]={atrMultSl:layerCfg.atrSl,atrMultTp:layerCfg.atrTp};
+  var lp=b.cfg.layerParams[layer];
+  if(wr<0.40&&lp.atrMultSl<3.0){lp.atrMultSl=+(Math.min(3.0,lp.atrMultSl+0.1)).toFixed(1);changes.push(layerCfg.name+'ATR止損->'+lp.atrMultSl);}
+  if(wr>=0.55&&lp.atrMultTp>2.0){lp.atrMultTp=+(Math.max(2.0,lp.atrMultTp-0.1)).toFixed(1);changes.push(layerCfg.name+'ATR止盈->'+lp.atrMultTp);}
+  b.cfg.layerParams[layer]=lp;
+  if(changes.length){
+    log('AI','['+layer+'] 層調整: '+changes.join(' | '),b);
+    tgBot(b,'[BingX 🧠] '+layerCfg.name+'層調整\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'%');
+    saveBots();
+  }
+}
+
+function autoAdjust(b){
+  if(!b.brain)return;
+  if(!b.cfg.layerParams)b.cfg.layerParams={scalp:{atrMultSl:1.5,atrMultTp:2.5},swing:{atrMultSl:2.0,atrMultTp:3.5},long:{atrMultSl:2.5,atrMultTp:5.0}};
+  var recent=b.stats.trades.slice(-25);if(recent.length<5)return;
+  var wins=recent.filter(function(t){return t.pnl>0;});
+  var wr=wins.length/recent.length;
+  var changes=[];
+  if(!b.brain.bestParamsList)b.brain.bestParamsList=[];
+  if(!b.brain.explorationHistory)b.brain.explorationHistory=[];
+  b.brain.explorationHistory.push({params:Object.assign({},b.cfg.layerParams),wr,date:todayKey()});
+  if(b.brain.explorationHistory.length>50)b.brain.explorationHistory=b.brain.explorationHistory.slice(-50);
+  var isLocked=b.brain.locked&&b.brain.bestParams;
+  if(isLocked&&wr<0.3){b.brain.locked=false;changes.push('⚠️ 勝率過低解鎖');tgBot(b,'[BingX 🧠] ⚠️ 勝率過低('+( wr*100).toFixed(1)+'%)解鎖重新探索');}
+  if(wr>=0.50&&!isLocked){
+    b.brain.bestParams=Object.assign({},b.cfg.layerParams);
+    b.brain.bestWR=wr;
+    b.brain.locked=true;
+    changes.push('🏆 最佳參數鎖定 WR:'+(wr*100).toFixed(1)+'%');
+    tgBot(b,'[BingX 🧠] 🏆 最佳參數鎖定！\nWR:'+(wr*100).toFixed(1)+'%');
+  }
+  // 更新最佳最差時段
+  var hp=b.brain.hourPerf||{};
+  b.brain.bestHours=Object.keys(hp).filter(function(h){var p=hp[h];var t=p.wins+p.losses;return t>=5&&p.wins/t>=0.55;});
+  b.brain.worstHours=Object.keys(hp).filter(function(h){var p=hp[h];var t=p.wins+p.losses;return t>=5&&p.wins/t<0.35;});
+  if(changes.length){
+    b.brain.adjustHistory=b.brain.adjustHistory||[];
+    b.brain.adjustHistory.push({date:todayKey(),changes,wr:(wr*100).toFixed(1)});
+    if(b.brain.adjustHistory.length>100)b.brain.adjustHistory=b.brain.adjustHistory.slice(-100);
+    tgBot(b,'[BingX 🧠] 自動調整\n'+changes.join('\n')+'\nWR:'+(wr*100).toFixed(1)+'%');
+    b.brain.learnCount=0;
+    saveBots();
+  }
 }
 
 // ══════════════════════════════════
 // 帶單跟單
 // ══════════════════════════════════
-// 跟單設定儲存在 bots[token].copyFrom = '主帳號token'
 async function copyTrade(masterBot,tradeInfo){
-  // 只有帶單員（leader）開單才觸發跟單
   if(masterBot.role!=='leader')return;
-  var followers=Object.values(bots).filter(function(b){
-    return b.cfg&&b.cfg.copyFrom===masterBot.token&&b.cfg.botRunning&&b.token!==masterBot.token;
-  });
+  var followers=Object.values(bots).filter(function(b){return b.cfg&&b.cfg.copyFrom===masterBot.token&&b.cfg.botRunning&&b.token!==masterBot.token;});
   if(!followers.length)return;
-  log('INFO','帶單: '+tradeInfo.symbol+' '+tradeInfo.side+' 跟單人數:'+followers.length);
   for(var i=0;i<followers.length;i++){
     var fb=followers[i];
     try{
-      var ax=api(fb);
-      var amt=fb.cfg.amount||1;
-      var layerCfg=LAYERS[tradeInfo.layer]||LAYERS.swing;
-      var o=await ax.placeOrder({
-        symbol:tradeInfo.symbol,
-        side:tradeInfo.side,
-        positionSide:tradeInfo.positionSide,
-        amt:amt,
-        lev:layerCfg.lev,
-        price:tradeInfo.price,
-        stopLoss:tradeInfo.stopLoss,
-        takeProfit:tradeInfo.takeProfit,
-        layer:'跟單'
-      });
-      if(o){
-        var key=tradeInfo.symbol+'_'+tradeInfo.layer+'_'+(tradeInfo.positionSide==='LONG'?'L':'S');
-        fb.openTrades[key]={symbol:tradeInfo.symbol,side:tradeInfo.positionSide,entry:tradeInfo.price,qty:1,layer:tradeInfo.layer,openTime:Date.now()};
-        saveBots();
-        tgBot(fb,'[BingX] 📋 跟單成功\n'+tradeInfo.symbol+' ['+(tradeInfo.side==='BUY'?'🟢 多':'🔴 空')+']\n跟隨: '+masterBot.name);
-      }
+      var fax=api(fb);
+      var lo=await fax.placeLimitOrder({
+        symbol:tradeInfo.symbol,side:tradeInfo.side,positionSide:tradeInfo.positionSide,
+        amt:fb.cfg.amount||1,lev:LAYERS[tradeInfo.layer].lev,
+        limitPrice:tradeInfo.price,stopLoss:tradeInfo.stopLoss,takeProfit:tradeInfo.takeProfit
+      }).catch(function(){return null;});
+      if(lo)tgBot(fb,'[BingX] 📋 跟單\n'+tradeInfo.symbol+' ['+(tradeInfo.side==='BUY'?'🟢 多':'🔴 空')+']\n跟隨: '+masterBot.name);
     }catch(e){log('ERROR','跟單失敗 '+fb.name+': '+e.message,fb);}
   }
 }
 
-function startMainLoop(){
-  setInterval(function(){
-    Object.values(bots).forEach(function(b){
-      if(b.cfg&&b.cfg.botRunning){
-        tradingLoop(b).catch(function(e){log('ERROR','BotLoop '+b.name+': '+e.message);});
-      }
-    });
-  },60000);
-  log('INFO','主循環啟動');
-}
-
 // ══════════════════════════════════
-// Telegram（每個Bot獨立polling）
+// Telegram
 // ══════════════════════════════════
 function tgBot(b,text){
   if(!b.token||!b.chatId)return;
-  var body=JSON.stringify({chat_id:b.chatId,text:text,parse_mode:'HTML'});
+  var body=JSON.stringify({chat_id:b.chatId,text,parse_mode:'HTML'});
   var req=https.request({hostname:'api.telegram.org',path:'/bot'+b.token+'/sendMessage',method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}},function(r){var d='';r.on('data',function(c){d+=c;});});
   req.on('error',function(){});req.write(body);req.end();
 }
 
-// 管理員Bot（錢錢）
 function tgAdmin(text){
   if(!ADMIN_TOKEN||!ADMIN_CHAT)return;
-  var body=JSON.stringify({chat_id:ADMIN_CHAT,text:text,parse_mode:'HTML'});
+  var body=JSON.stringify({chat_id:ADMIN_CHAT,text,parse_mode:'HTML'});
   var req=https.request({hostname:'api.telegram.org',path:'/bot'+ADMIN_TOKEN+'/sendMessage',method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}},function(r){var d='';r.on('data',function(c){d+=c;});});
   req.on('error',function(){});req.write(body);req.end();
 }
 
-// 各Bot的polling lastId
 var pollIds={};
-
 function startBotPolling(b){
   if(!b.token)return;
   pollIds[b.token]=pollIds[b.token]||0;
@@ -686,89 +846,122 @@ function startBotPolling(b){
     req.end();
   }
   poll();
-  log('INFO','Bot polling 啟動: '+b.name);
+  log('INFO','Bot polling: '+b.name);
 }
 
 function handleBotUpdate(b,update){
   var msg=update.message||update.edited_message;if(!msg)return;
   var chatId=String(msg.chat.id),text=(msg.text||'').trim();
-  // 更新 chatId
   if(b.chatId!==chatId){b.chatId=chatId;saveBots();}
   var parts=text.split(' '),cmd=parts[0].toLowerCase();
   log('INFO','CMD: '+cmd+' from '+b.name,b);
 
   if(cmd==='/help'||cmd==='/start'){
-    tgBot(b,'🐎 BingX 三層策略 v2\n\n短期(3m): ATR×1.5/2.5 門檻4\n中期(5m): ATR×2.0/3.5 門檻5\n長期(1h): ATR×2.5/5.0 門檻5\n限價掛單 + 分倉出場\nEMA50/200趨勢過濾\n\n/go - 啟動\n/stop - 停止\n/status - 狀態\n/positions - 持倉\n/pending - 掛單\n/stats - 績效\n/history - 近10筆\n/set amount N - 開倉金額\n/copy 名稱 - 跟單\n/stopcopy - 取消跟單\n/addsym SYMBOL\n/delsym SYMBOL\n/symbols - 幣種清單');return;
+    tgBot(b,'🎯 BingX 智能獵手系統\n\n【交易控制】\n/go - 啟動\n/stop - 停止\n/status - 狀態\n\n【查詢】\n/positions - 持倉\n/stats - 績效\n/history - 近10筆\n/brain - 學習狀態\n/market - 最新掃描結果\n\n【設定】\n/set amount N - 開倉金額\n/set scalp on/off - 短期開關\n/set swing on/off - 中期開關\n/set long on/off - 長期開關\n/short - 切換空單\n\n【跟單】\n/copy 名稱 - 跟單\n/stopcopy - 取消跟單');return;
   }
+
   if(cmd==='/go'){
     if(b.cfg.botRunning){tgBot(b,'⚠️ 已在運行');return;}
     b.cfg.botRunning=true;saveBots();
-    tradingLoop(b).catch(function(e){log('ERROR','Go: '+e.message,b);});
-    tgBot(b,'🚀 啟動!\n幣種: '+b.cfg.symbols.join(',')+'\n金額: '+b.cfg.amount+'U × 5x\nSelf-Learning: ON ✅');return;
+    tgBot(b,'🚀 智能獵手啟動！\n\n系統每15分鐘掃描全市場\n找出漲跌幅前3名\nWyckoff + 數據獵手雙重確認\n限價掛單模式\n\n等待掃描結果...');return;
   }
+
   if(cmd==='/stop'){b.cfg.botRunning=false;saveBots();tgBot(b,'⏹ 已停止');return;}
+
   if(cmd==='/status'){
     api(b).getBalance().then(function(bal){
       var today=todayKey(),d=b.stats.daily[today]||{total:0,wins:0,losses:0,pnl:0},all=b.stats.allTime;
-      tgBot(b,'[BingX] 狀態\n'+(b.cfg.botRunning?'🟢 運行中':'🔴 已停止')+'\n餘額:'+bal.available.toFixed(2)+'U\n今日:'+d.total+'筆 WR:'+(d.total>0?(d.wins/d.total*100).toFixed(0):0)+'% PnL:'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'U\n累計:'+all.total+'筆 PnL:'+(all.pnl>=0?'+':'')+all.pnl.toFixed(2)+'U\n持倉:'+Object.keys(b.openTrades).length+'\n金額:'+b.cfg.amount+'U');
+      var posCount=Object.keys(b.openTrades).length;
+      var lastScan=marketScanResult.lastScan?new Date(marketScanResult.lastScan).toLocaleString('zh-TW',{timeZone:'Asia/Taipei'}):'尚未掃描';
+      tgBot(b,'[BingX] 狀態\n'+(b.cfg.botRunning?'🟢 運行中':'🔴 已停止')+'\n餘額:'+bal.available.toFixed(2)+'U\n今日:'+d.total+'筆 WR:'+(d.total>0?(d.wins/d.total*100).toFixed(0):0)+'% PnL:'+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+'U\n累計:'+all.total+'筆 PnL:'+(all.pnl>=0?'+':'')+all.pnl.toFixed(2)+'U\n持倉:'+posCount+'\n金額:'+b.cfg.amount+'U\n上次掃描:'+lastScan);
     }).catch(function(e){tgBot(b,'Error: '+e.message);});return;
   }
-  if(cmd==='/stats'){
-    var al=b.stats.allTime,today2=todayKey(),dds=b.stats.daily[today2]||{total:0,wins:0,losses:0,pnl:0};
-    tgBot(b,'[BingX] 📊 績效\n今日:'+dds.total+'筆 WR:'+(dds.total>0?(dds.wins/dds.total*100).toFixed(0):0)+'% PnL:'+(dds.pnl>=0?'+':'')+dds.pnl.toFixed(2)+'U\n累計:'+al.total+'筆 WR:'+(al.total>0?(al.wins/al.total*100).toFixed(1):0)+'% PnL:'+(al.pnl>=0?'+':'')+al.pnl.toFixed(2)+'U');return;
-  }
+
   if(cmd==='/positions'){
     var keys=Object.keys(b.openTrades);
     if(!keys.length){tgBot(b,'無持倉');return;}
     var m='[BingX] 持倉\n\n';
-    keys.forEach(function(k){var t=b.openTrades[k];m+=(t.side==='LONG'?'🟢':'🔴')+' '+t.symbol+' ['+LAYERS[t.layer].name+']\nHold:'+Math.round((Date.now()-t.openTime)/60000)+'min\n\n';});
+    keys.forEach(function(k){
+      var t=b.openTrades[k];
+      m+=(t.side==='LONG'?'🟢':'🔴')+' '+t.symbol+' ['+LAYERS[t.layer].name+']\n';
+      m+=(t.isPending?'📋掛單中':'持倉中')+' Hold:'+Math.round((Date.now()-t.openTime)/60000)+'min\n\n';
+    });
     tgBot(b,m);return;
   }
+
+  if(cmd==='/stats'){
+    var al=b.stats.allTime,today2=todayKey(),dds=b.stats.daily[today2]||{total:0,wins:0,losses:0,pnl:0};
+    tgBot(b,'[BingX] 📊 績效\n今日:'+dds.total+'筆 WR:'+(dds.total>0?(dds.wins/dds.total*100).toFixed(0):0)+'% PnL:'+(dds.pnl>=0?'+':'')+dds.pnl.toFixed(2)+'U\n累計:'+al.total+'筆 WR:'+(al.total>0?(al.wins/al.total*100).toFixed(1):0)+'% PnL:'+(al.pnl>=0?'+':'')+al.pnl.toFixed(2)+'U');return;
+  }
+
   if(cmd==='/history'){
     var tr=b.stats.trades.slice(-10).reverse();if(!tr.length){tgBot(b,'尚無交易');return;}
     tgBot(b,'[BingX] 近10筆\n'+tr.map(function(t){return (t.pnl>=0?'✅':'❌')+' '+t.symbol+'['+(t.layer||'?')+'] '+(t.pnl>=0?'+':'')+t.pnl.toFixed(4)+'U '+t.reason;}).join('\n'));return;
   }
+
+  if(cmd==='/brain'){
+    var br=b.brain||{};
+    var lastAdj=br.adjustHistory&&br.adjustHistory.length?br.adjustHistory[br.adjustHistory.length-1]:{changes:['尚未調整'],wr:'N/A'};
+    var msg='[BingX] 🧠 學習狀態\n';
+    msg+='已學習:'+(br.learnCount||0)+'次\n';
+    msg+='鎖定狀態:'+(br.locked?'🔒已鎖定':'🔓探索中')+'\n';
+    msg+='最佳WR:'+((br.bestWR)?(br.bestWR*100).toFixed(1):'N/A')+'%\n\n';
+    msg+='【最近調整】\n'+lastAdj.changes.join('\n')+'\nWR:'+lastAdj.wr+'%\n\n';
+    var ls=br.layerStats||{};
+    ['scalp','swing','long'].forEach(function(ln){
+      var lName={scalp:'短期',swing:'中期',long:'長期'}[ln];
+      var lStat=ls[ln]||{learnCount:0,trades:[]};
+      var lTrades=lStat.trades||[];
+      var lWins=lTrades.filter(function(t){return t.pnl>0;}).length;
+      var lWR=lTrades.length>0?(lWins/lTrades.length*100).toFixed(0):0;
+      var lp=(b.cfg.layerParams&&b.cfg.layerParams[ln])||{};
+      msg+='【'+lName+'】學習:'+lStat.learnCount+'筆 WR:'+lWR+'%\n';
+      msg+='ATR止損:'+(lp.atrMultSl||'-')+'x 止盈:'+(lp.atrMultTp||'-')+'x\n\n';
+    });
+    tgBot(b,msg);return;
+  }
+
+  if(cmd==='/market'){
+    if(!marketScanResult.lastScan){tgBot(b,'尚未掃描');return;}
+    var m2='📊 最新市場掃描\n\n漲幅前3:\n';
+    (marketScanResult.topGainers||[]).slice(0,3).forEach(function(t,i){
+      m2+=(i+1)+'名 '+t.symbol+' +'+parseFloat(t.priceChangePercent).toFixed(2)+'%\n';
+    });
+    m2+='\n跌幅前3:\n';
+    (marketScanResult.topLosers||[]).slice(0,3).forEach(function(t,i){
+      m2+=(i+1)+'名 '+t.symbol+' '+parseFloat(t.priceChangePercent).toFixed(2)+'%\n';
+    });
+    m2+='\n上次掃描: '+new Date(marketScanResult.lastScan).toLocaleString('zh-TW',{timeZone:'Asia/Taipei'});
+    tgBot(b,m2);return;
+  }
+
   if(cmd==='/set'&&parts[1]==='amount'&&parts[2]){
     var amt=parseFloat(parts[2]);
-    if(amt>=1&&amt<=100){b.cfg.amount=amt;saveBots();tgBot(b,'✅ 開倉金額 -> '+amt+'U × 5x = '+(amt*5)+'U 名義');}
-    else tgBot(b,'金額需在 1-100U 之間');return;
+    if(amt>=1&&amt<=100){b.cfg.amount=amt;saveBots();tgBot(b,'✅ 開倉金額 -> '+amt+'U');}
+    else tgBot(b,'金額需在 1-100U');return;
   }
-  if(cmd==='/pending'){
-    if(!b.pendingOrders||!Object.keys(b.pendingOrders).length){tgBot(b,'無掛單');return;}
-    var pm='[BingX] 掛單\n\n';
-    Object.values(b.pendingOrders).forEach(function(po){pm+='📋 '+po.symbol+' ['+po.layerName+']\n掛單價:'+po.limitPrice+'\n等待:'+Math.round((Date.now()-po.openTime)/60000)+'min\n\n';});
-    tgBot(b,pm);return;
-  }
+
+  if(cmd==='/set'&&parts[1]==='scalp'&&parts[2]){b.cfg.layers=b.cfg.layers||{scalp:true,swing:true,long:true};b.cfg.layers.scalp=parts[2]==='on';saveBots();tgBot(b,'✅ 短期 -> '+(b.cfg.layers.scalp?'開啟':'關閉'));return;}
+  if(cmd==='/set'&&parts[1]==='swing'&&parts[2]){b.cfg.layers=b.cfg.layers||{scalp:true,swing:true,long:true};b.cfg.layers.swing=parts[2]==='on';saveBots();tgBot(b,'✅ 中期 -> '+(b.cfg.layers.swing?'開啟':'關閉'));return;}
+  if(cmd==='/set'&&parts[1]==='long'&&parts[2]){b.cfg.layers=b.cfg.layers||{scalp:true,swing:true,long:true};b.cfg.layers.long=parts[2]==='on';saveBots();tgBot(b,'✅ 長期 -> '+(b.cfg.layers.long?'開啟':'關閉'));return;}
+  if(cmd==='/short'){b.cfg.allowShort=!b.cfg.allowShort;saveBots();tgBot(b,'✅ 空單 -> '+(b.cfg.allowShort?'開啟':'關閉'));return;}
+
   if(cmd==='/copy'){
     if(!parts[1]){
-      // 顯示可跟單的帶單員
       var leaders=Object.values(bots).filter(function(lb){return lb.role==='leader';});
       if(!leaders.length){tgBot(b,'目前沒有帶單員');return;}
-      tgBot(b,'🌟 可跟單的帶單員:\n'+leaders.map(function(lb){return lb.name;}).join('\n')+'\n\n/copy 名稱 開始跟單');return;
+      tgBot(b,'🌟 可跟單:\n'+leaders.map(function(lb){return lb.name;}).join('\n')+'\n\n/copy 名稱 開始跟單');return;
     }
-    var masterName=parts[1];
-    var masterBot=Object.values(bots).find(function(mb){return mb.name===masterName&&mb.role==='leader';});
-    if(masterBot){
-      b.cfg.copyFrom=masterBot.token;
-      saveBots();
-      tgBot(b,'✅ 已設定跟單: '+masterName+'\n每次開單自動跟隨\n\n/stopcopy 取消跟單');
-    }else{
-      tgBot(b,'❌ 找不到帶單員: '+masterName+'\n\n發 /copy 查看可跟單的帶單員');
-    }
-    return;
+    var masterBot=Object.values(bots).find(function(mb){return mb.name===parts[1]&&mb.role==='leader';});
+    if(masterBot){b.cfg.copyFrom=masterBot.token;saveBots();tgBot(b,'✅ 跟單: '+parts[1]);}
+    else tgBot(b,'找不到帶單員: '+parts[1]);return;
   }
-  if(cmd==='/stopcopy'){
-    delete b.cfg.copyFrom;
-    saveBots();
-    tgBot(b,'✅ 已取消跟單');
-    return;
-  }
+
+  if(cmd==='/stopcopy'){delete b.cfg.copyFrom;saveBots();tgBot(b,'✅ 已取消跟單');return;}
   if(text.startsWith('/'))tgBot(b,'未知指令，輸入 /help');
 }
 
-// ══════════════════════════════════
-// 管理員Bot（錢錢）指令
-// ══════════════════════════════════
+// 管理員 polling
 var adminPollId=0;
 function startAdminPolling(){
   var token=ADMIN_TOKEN;
@@ -783,9 +976,7 @@ function startAdminPolling(){
             json.result.forEach(function(u){
               if(u.update_id>adminPollId)adminPollId=u.update_id;
               var msg=u.message||u.edited_message;
-              if(msg&&String(msg.chat.id)===ADMIN_CHAT){
-                setImmediate(function(){handleAdminUpdate(u);});
-              }
+              if(msg&&String(msg.chat.id)===ADMIN_CHAT)setImmediate(function(){handleAdminUpdate(u);});
             });
           }
         }catch(e){}
@@ -797,7 +988,7 @@ function startAdminPolling(){
     req.end();
   }
   poll();
-  log('INFO','管理員Bot polling 啟動');
+  log('INFO','管理員polling啟動');
 }
 
 function handleAdminUpdate(update){
@@ -806,69 +997,55 @@ function handleAdminUpdate(update){
   log('INFO','ADMIN CMD: '+cmd);
 
   if(cmd==='/help'){
-    tgAdmin('👑 管理員指令\n\n/addbot TOKEN NAME APIKEY SECRET - 新增Bot\n/bots - 所有Bot狀態\n/delbot TOKEN - 刪除Bot\n/setleader 名稱 - 設定帶單員\n/removeleader 名稱 - 移除帶單員\n/leaders - 帶單員列表\n/scalp N - 短期門檻(全部)\n/swing N - 中期門檻(全部)\n/long N - 長期門檻(全部)\n/log - 系統日誌\n/broadcast 訊息 - 廣播');return;
+    tgAdmin('👑 管理員指令\n\n/addbot TOKEN NAME APIKEY SECRET\n/bots - Bot列表\n/delbot TOKEN\n/setleader 名稱\n/removeleader 名稱\n/leaders - 帶單員列表\n/scan - 立即掃描市場\n/log - 系統日誌\n/broadcast 訊息');return;
   }
 
   if(cmd==='/addbot'&&parts.length>=5){
     var token=parts[1],name=parts[2],apiKey=parts[3],secret=parts[4];
-    // 驗證 API Key
     bxReq('GET','/openApi/swap/v2/user/balance',{},apiKey,secret).then(function(r){
       if(r.code===0){
         var bal=parseFloat(r.data.balance.availableMargin||0);
         var b=createBot(token,'',name,apiKey,secret);
         startBotPolling(b);
-        tgAdmin('✅ 新增Bot成功\n名稱: '+name+'\n餘額: '+bal.toFixed(2)+'U\n\n請讓用戶對Bot發 /start');
-      }else{
-        tgAdmin('❌ API Key 驗證失敗\n'+r.msg);
-      }
-    }).catch(function(e){tgAdmin('❌ 連線失敗: '+e.message);});
-    return;
+        tgAdmin('✅ 新增Bot: '+name+'\n餘額: '+bal.toFixed(2)+'U');
+      }else tgAdmin('❌ API驗證失敗: '+r.msg);
+    }).catch(function(e){tgAdmin('❌ 連線失敗: '+e.message);});return;
   }
 
   if(cmd==='/bots'){
     var botList=Object.values(bots);
     if(!botList.length){tgAdmin('目前沒有Bot');return;}
-    var m='[管理員] Bot 列表\n共 '+botList.length+' 個\n\n';
-    botList.forEach(function(b){
-      m+=b.name+': '+(b.cfg.botRunning?'🟢':'🔴')+' 持倉:'+Object.keys(b.openTrades).length+' 累計:'+b.stats.allTime.pnl.toFixed(2)+'U\n';
-    });
+    var m='Bot列表\n共 '+botList.length+' 個\n\n';
+    botList.forEach(function(b){m+=b.name+': '+(b.cfg.botRunning?'🟢':'🔴')+' 持倉:'+Object.keys(b.openTrades).length+' PnL:'+b.stats.allTime.pnl.toFixed(2)+'U\n';});
     tgAdmin(m);return;
   }
 
+  if(cmd==='/delbot'&&parts[1]){
+    if(bots[parts[1]]){var n=bots[parts[1]].name;delete bots[parts[1]];saveBots();tgAdmin('✅ 已刪除: '+n);}
+    else tgAdmin('找不到Bot');return;
+  }
+
   if(cmd==='/setleader'&&parts[1]){
-    var leaderName=parts[1];
-    var leaderBot=Object.values(bots).find(function(b){return b.name===leaderName;});
-    if(leaderBot){
-      leaderBot.role='leader';saveBots();
-      tgAdmin('✅ 已設定帶單員: '+leaderName);
-      tgBot(leaderBot,'🌟 您已獲得帶單員權限\n您的開單將會帶動跟單者');
-    }else tgAdmin('找不到: '+leaderName);return;
+    var lb=Object.values(bots).find(function(b){return b.name===parts[1];});
+    if(lb){lb.role='leader';saveBots();tgAdmin('✅ 帶單員: '+parts[1]);tgBot(lb,'🌟 您已獲得帶單員權限');}
+    else tgAdmin('找不到: '+parts[1]);return;
   }
 
   if(cmd==='/removeleader'&&parts[1]){
-    var rName=parts[1];
-    var rBot=Object.values(bots).find(function(b){return b.name===rName;});
-    if(rBot){
-      rBot.role='user';saveBots();
-      tgAdmin('✅ 已移除帶單員: '+rName);
-      tgBot(rBot,'⚠️ 您的帶單員權限已被移除');
-    }else tgAdmin('找不到: '+rName);return;
+    var rb=Object.values(bots).find(function(b){return b.name===parts[1];});
+    if(rb){rb.role='user';saveBots();tgAdmin('✅ 移除帶單員: '+parts[1]);tgBot(rb,'⚠️ 帶單員權限已移除');}
+    else tgAdmin('找不到: '+parts[1]);return;
   }
 
   if(cmd==='/leaders'){
     var leaders=Object.values(bots).filter(function(b){return b.role==='leader';});
-    tgAdmin('🌟 帶單員列表\n'+(leaders.length?leaders.map(function(b){return b.name+' (跟單:'+Object.values(bots).filter(function(f){return f.cfg&&f.cfg.copyFrom===b.token;}).length+'人)';}).join('\n'):'尚無帶單員'));return;
+    tgAdmin('帶單員:\n'+(leaders.length?leaders.map(function(b){return b.name;}).join('\n'):'無'));return;
   }
 
-  if(cmd==='/delbot'&&parts[1]){
-    var token2=parts[1];
-    if(bots[token2]){var name2=bots[token2].name;delete bots[token2];saveBots();tgAdmin('✅ 已刪除Bot: '+name2);}
-    else tgAdmin('找不到Bot: '+token2);return;
+  if(cmd==='/scan'){
+    tgAdmin('🔍 開始掃描...');
+    scanMarket().then(function(){tgAdmin('✅ 掃描完成');}).catch(function(e){tgAdmin('❌ 掃描失敗: '+e.message);});return;
   }
-
-  if(cmd==='/scalp'&&parts[1]){var nv=parseFloat(parts[1]);if(nv>=1&&nv<=6){LAYERS.scalp.threshold=Math.round(nv);tgAdmin('✅ 短期門檻(全部) -> '+LAYERS.scalp.threshold);}return;}
-  if(cmd==='/swing'&&parts[1]){var nv2=parseFloat(parts[1]);if(nv2>=1&&nv2<=6){LAYERS.swing.threshold=Math.round(nv2);tgAdmin('✅ 中期門檻(全部) -> '+LAYERS.swing.threshold);}return;}
-  if(cmd==='/long'&&parts[1]){var nv3=parseFloat(parts[1]);if(nv3>=1&&nv3<=6){LAYERS.long.threshold=Math.round(nv3);tgAdmin('✅ 長期門檻(全部) -> '+LAYERS.long.threshold);}return;}
 
   if(cmd==='/log'){
     var logs=sysLog.slice(-15).map(function(l){return '['+l.lv+'] '+l.msg.slice(0,60);}).join('\n');
@@ -878,8 +1055,30 @@ function handleAdminUpdate(update){
   if(cmd==='/broadcast'&&parts.length>1){
     var broadMsg=parts.slice(1).join(' ');
     Object.values(bots).forEach(function(b){tgBot(b,'📢 系統公告\n'+broadMsg);});
-    tgAdmin('✅ 廣播完成，共 '+Object.keys(bots).length+' 個Bot');return;
+    tgAdmin('✅ 廣播完成');return;
   }
+}
+
+// ══════════════════════════════════
+// 主循環
+// ══════════════════════════════════
+var mainTimer=null,scanTimer=null;
+
+function startMainLoop(){
+  if(mainTimer)return;
+  // 每1分鐘檢查持倉
+  mainTimer=setInterval(function(){
+    Object.values(bots).forEach(function(b){
+      if(b.cfg&&b.cfg.botRunning){
+        tradingLoopUser(b).catch(function(e){log('ERROR','BotLoop '+b.name+': '+e.message);});
+      }
+    });
+  },60000);
+  // 每15分鐘掃描市場
+  scanTimer=setInterval(function(){
+    scanMarket().catch(function(e){log('ERROR','掃描失敗: '+e.message);});
+  },15*60*1000);
+  log('INFO','主循環啟動');
 }
 
 function startServer(){
@@ -887,22 +1086,22 @@ function startServer(){
 }
 
 async function main(){
-  console.log('\nBingX 多Bot伺服器 v1.0\n');
+  console.log('\nBingX 智能獵手系統 v2.0\n');
   log('INFO','Starting...');
   startServer();
   startMainLoop();
   startAdminPolling();
-  // 啟動所有已有Bot的polling並恢復持倉
-  Object.values(bots).forEach(function(b){
-    startBotPolling(b);
-    recoverPositions(b).catch(function(){});
-  });
+  Object.values(bots).forEach(function(b){startBotPolling(b);});
+
+  // 立即做一次市場掃描
+  await scanMarket().catch(function(e){log('WARN','初始掃描失敗: '+e.message);});
+
   var activeCount=Object.values(bots).filter(function(b){return b.cfg&&b.cfg.botRunning;}).length;
-  tgAdmin('[BingX 伺服器] 🟢 上線!\n共 '+Object.keys(bots).length+' 個Bot\n運行中: '+activeCount+'\n\n新增Bot:\n/addbot TOKEN 名稱 APIKEY SECRET');
+  tgAdmin('[智能獵手 v2.0] 🟢 上線!\nBot數: '+Object.keys(bots).length+'\n運行中: '+activeCount+'\n\n每15分鐘掃描全市場\nWyckoff + 數據獵手雙重確認\n限價掛單模式\n\n/addbot 新增Bot');
   log('OK','Ready. Bots: '+Object.keys(bots).length);
 }
 
-process.on('uncaughtException',function(e){log('ERROR','Uncaught: '+e.message);});
+process.on('uncaughtException',function(e){log('ERROR','Uncaught: '+e.message);tgAdmin('🚨 系統異常: '+e.message);});
 process.on('unhandledRejection',function(e){log('ERROR','Unhandled: '+(e&&e.message?e.message:String(e)));});
-process.on('SIGINT',function(){tgAdmin('⛔ 伺服器關閉');setTimeout(function(){process.exit(0);},2000);});
+process.on('SIGINT',function(){tgAdmin('⛔ 系統關閉');setTimeout(function(){process.exit(0);},2000);});
 main().catch(function(e){log('ERROR','Start fail: '+e.message);process.exit(1);});
