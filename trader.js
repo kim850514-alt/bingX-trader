@@ -520,16 +520,25 @@ async function checkPositions(b){
       var estPct=ps==='LONG'?(cur-t.entry)/t.entry*100:(t.entry-cur)/t.entry*100;
       log('INFO','持倉 '+t.symbol+' ['+layer+'] '+(estPct>=0?'+':'')+estPct.toFixed(2)+'% Hold:'+holdMin+'min',b);
 
-      // 移動止損：達到 TP1 時 SL 移到開倉價和 TP1 中間
-      var tp1Pct=(layerCfg.atrTp*0.5);
-      if(estPct>=tp1Pct&&!t.slMoved){
-        t.slMoved=true;
-        var tp1Price=ps==='LONG'?t.entry*(1+tp1Pct/100):t.entry*(1-tp1Pct/100);
-        var newSl=+((t.entry+tp1Price)/2).toFixed(6);
+      // ✅ 動態移動止損：每獲利10%往上移一格
+      if(!t.trailLevel)t.trailLevel=0;
+      var newTrailLevel=Math.floor(estPct/10); // 0=未啟動, 1=10%, 2=20%...
+      if(newTrailLevel>t.trailLevel&&newTrailLevel>=1){
+        t.trailLevel=newTrailLevel;
+        var lockPct=(newTrailLevel-1)*10; // 鎖定上一格
+        var newSl;
+        if(lockPct===0){
+          // 獲利10% → SL移到開倉價（保本）
+          newSl=+t.entry.toFixed(6);
+        }else{
+          // 獲利20%+ → SL移到上一個10%位置
+          newSl=ps==='LONG'?+(t.entry*(1+lockPct/100)).toFixed(6):+(t.entry*(1-lockPct/100)).toFixed(6);
+        }
         try{
           await bxReq('POST','/openApi/swap/v2/trade/order',{symbol:t.symbol,side:ps==='LONG'?'SELL':'BUY',positionSide:ps,type:'STOP_MARKET',stopPrice:String(newSl),quantity:String(t.qty),workingType:'MARK_PRICE'},b.apiKey,b.secret);
-          tgBot(b,'[BingX] 🔒 止損上移\n'+t.symbol+' ['+layerCfg.name+']\n新止損: '+newSl);
-        }catch(e){}
+          tgBot(b,'[BingX] 🔒 移動止損\n'+t.symbol+' ['+layerCfg.name+']\n獲利: +'+estPct.toFixed(1)+'%\n止損移至: '+newSl+(lockPct===0?' (保本)':' (鎖定+'+lockPct+'%)'));
+          log('OK',t.symbol+' 移動止損 -> '+newSl+' (獲利'+estPct.toFixed(1)+'%)',b);
+        }catch(e){log('WARN',t.symbol+' 移動止損失敗: '+e.message,b);}
       }
 
       // 超時平倉
@@ -1066,7 +1075,7 @@ var mainTimer=null,scanTimer=null;
 
 function startMainLoop(){
   if(mainTimer)return;
-  // 每1分鐘檢查持倉
+  // 每1分鐘掃描新訊號
   mainTimer=setInterval(function(){
     Object.values(bots).forEach(function(b){
       if(b.cfg&&b.cfg.botRunning){
@@ -1074,6 +1083,14 @@ function startMainLoop(){
       }
     });
   },60000);
+  // 每30秒實時監控倉位（動態移動止損）
+  setInterval(function(){
+    Object.values(bots).forEach(function(b){
+      if(b.cfg&&b.cfg.botRunning&&Object.keys(b.openTrades).length>0){
+        checkPositions(b).catch(function(e){log('ERROR','checkPos '+b.name+': '+e.message);});
+      }
+    });
+  },30000);
   // 每15分鐘掃描市場
   scanTimer=setInterval(function(){
     scanMarket().catch(function(e){log('ERROR','掃描失敗: '+e.message);});
