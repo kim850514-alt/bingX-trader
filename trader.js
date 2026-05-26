@@ -24,14 +24,14 @@ const STRATEGIES={
     desc:'長影線反轉，在支撐阻力位捕捉主力反向操作',
     token:'8556121528:AAH03kAeFz9fn9zobHsK16sQqiiw3rPtMy0'
   },
-  ema:{
-    name:'EMA交叉',emoji:'📈',tf:'1h',lev:5,
-    desc:'短期EMA穿越長期EMA，追蹤趨勢方向',
+  shortwave:{
+    name:'短波策略',emoji:'⚡',tf:'5m',lev:5,
+    desc:'5分鐘K線快進快出，捕捉短期波動',
     token:'8725981993:AAE8S_s47BBnEhS6RlNZglwueq0X7sohQiM'
   },
-  rsi:{
-    name:'RSI反轉',emoji:'📊',tf:'1h',lev:5,
-    desc:'RSI超買超賣區間，捕捉極端情緒反轉',
+  longwave:{
+    name:'長波策略',emoji:'🌊',tf:'4h',lev:5,
+    desc:'4小時K線大趨勢操作，耐心等待強訊號',
     token:'8860540887:AAGXQASgMvaITFV4c8qFG1Td6DGDVRsLpL8'
   },
   boll:{
@@ -327,68 +327,116 @@ function analyzePinBar(closes,highs,lows,opens){
   return result;
 }
 
-// 2. EMA交叉策略
-function analyzeEMA(closes,highs,lows){
+// 2. 短波策略（5分鐘快進快出）
+function analyzeShortWave(closes,highs,lows,opens,vols){
   var result={signal:'NONE',pattern:'',strength:0,details:[]};
-  if(closes.length<55)return result;
-  var ema9=I.ema(closes,9),ema21=I.ema(closes,21),ema55=I.ema(closes,55);
-  if(!ema9||!ema21||!ema55)return result;
-  var prev9=I.ema(closes.slice(0,-1),9),prev21=I.ema(closes.slice(0,-1),21);
-  if(!prev9||!prev21)return result;
-  var rsiVal=I.rsi(closes,14);
-  // 金叉：EMA9上穿EMA21，且EMA21>EMA55
-  if(prev9<prev21&&ema9>ema21&&ema21>ema55){
+  if(closes.length<20)return result;
+  var cur=closes[closes.length-1];
+  var rsi=I.rsi(closes,14);
+  var ema9=I.ema(closes,9),ema21=I.ema(closes,21);
+  var boll=I.boll(closes,20,2);
+  var avgVol=vols.slice(-10,-1).reduce(function(s,v){return s+v;},0)/9;
+  var lastVol=vols[vols.length-1];
+  var volSpike=lastVol>avgVol*1.8;
+  var prev9=I.ema(closes.slice(0,-1),9);
+  var prev21=I.ema(closes.slice(0,-1),21);
+  if(!ema9||!ema21||!prev9||!prev21)return result;
+
+  // 快速金叉 + 成交量放大 + RSI動能
+  if(prev9<prev21&&ema9>ema21&&volSpike&&rsi&&rsi>50&&rsi<75){
     var s=3;
-    if(ema9>ema55)s++;
-    if(rsiVal&&rsiVal>50&&rsiVal<70)s++;
-    result.signal='BUY';result.pattern='EMA金叉';result.strength=s;
-    result.details.push('EMA9:'+ema9.toFixed(4)+' > EMA21:'+ema21.toFixed(4));
-    result.details.push('趨勢確認 EMA21>EMA55');
-    if(rsiVal)result.details.push('RSI:'+rsiVal.toFixed(1));
+    if(volSpike)s++;
+    if(rsi>55)s++;
+    if(boll&&cur>boll.mid)s++;
+    result.signal='BUY';result.pattern='短波金叉';result.strength=s;
+    result.details.push('EMA快速金叉');
+    result.details.push('量能放大 '+(lastVol/avgVol).toFixed(1)+'倍');
+    result.details.push('RSI:'+rsi.toFixed(1));
     return result;
   }
-  // 死叉：EMA9下穿EMA21，且EMA21<EMA55
-  if(prev9>prev21&&ema9<ema21&&ema21<ema55){
-    var s3=3;
-    if(ema9<ema55)s3++;
-    if(rsiVal&&rsiVal<50&&rsiVal>30)s3++;
-    result.signal='SELL';result.pattern='EMA死叉';result.strength=s3;
-    result.details.push('EMA9:'+ema9.toFixed(4)+' < EMA21:'+ema21.toFixed(4));
-    result.details.push('趨勢確認 EMA21<EMA55');
-    if(rsiVal)result.details.push('RSI:'+rsiVal.toFixed(1));
+  // 快速死叉 + 成交量放大 + RSI動能
+  if(prev9>prev21&&ema9<ema21&&volSpike&&rsi&&rsi<50&&rsi>25){
+    var s2=3;
+    if(volSpike)s2++;
+    if(rsi<45)s2++;
+    if(boll&&cur<boll.mid)s2++;
+    result.signal='SELL';result.pattern='短波死叉';result.strength=s2;
+    result.details.push('EMA快速死叉');
+    result.details.push('量能放大 '+(lastVol/avgVol).toFixed(1)+'倍');
+    result.details.push('RSI:'+rsi.toFixed(1));
+    return result;
+  }
+  // 超短RSI極端反轉
+  if(rsi&&rsi<20&&closes[closes.length-1]>closes[closes.length-2]){
+    result.signal='BUY';result.pattern='短波超賣';result.strength=4;
+    result.details.push('RSI極度超賣:'+rsi.toFixed(1));
+    return result;
+  }
+  if(rsi&&rsi>80&&closes[closes.length-1]<closes[closes.length-2]){
+    result.signal='SELL';result.pattern='短波超買';result.strength=4;
+    result.details.push('RSI極度超買:'+rsi.toFixed(1));
     return result;
   }
   return result;
 }
 
-// 3. RSI反轉策略
-function analyzeRSI(closes,highs,lows){
+// 3. 長波策略（4小時大趨勢）
+function analyzeLongWave(closes,highs,lows,opens,vols){
   var result={signal:'NONE',pattern:'',strength:0,details:[]};
-  if(closes.length<20)return result;
-  var rsi=I.rsi(closes,14),rsiPrev=I.rsi(closes.slice(0,-1),14);
-  if(!rsi||!rsiPrev)return result;
-  var boll=I.boll(closes,20,2);
+  if(closes.length<55)return result;
   var cur=closes[closes.length-1];
-  // RSI超賣+回升
-  if(rsi<30&&rsi>rsiPrev){
-    var s=3;
-    if(rsi<25)s++;
-    if(boll&&cur<boll.lower)s++;
-    if(rsi>rsiPrev+2)s++;
-    result.signal='BUY';result.pattern='RSI超賣反轉';result.strength=s;
-    result.details.push('RSI:'+rsi.toFixed(1)+' 超賣回升');
-    if(boll&&cur<boll.lower)result.details.push('跌破布林下軌');
+  var ema21=I.ema(closes,21),ema55=I.ema(closes,55);
+  var prevEma21=I.ema(closes.slice(0,-1),21);
+  var prevEma55=I.ema(closes.slice(0,-1),55);
+  if(!ema21||!ema55||!prevEma21||!prevEma55)return result;
+  var rsi=I.rsi(closes,14);
+  var boll=I.boll(closes,20,2);
+  // 支撐阻力
+  var support=Math.min.apply(null,lows.slice(-30,-1));
+  var resistance=Math.max.apply(null,highs.slice(-30,-1));
+
+  // 大趨勢翻多：EMA21上穿EMA55 + 收盤確認
+  if(prevEma21<prevEma55&&ema21>ema55&&cur>ema21){
+    var s=4;
+    if(rsi&&rsi>50&&rsi<70)s++;
+    if(cur>ema55*1.01)s++;
+    if(boll&&cur>boll.mid)s++;
+    result.signal='BUY';result.pattern='長波趨勢翻多';result.strength=s;
+    result.details.push('EMA21('+ema21.toFixed(4)+') 上穿 EMA55('+ema55.toFixed(4)+')');
+    result.details.push('大趨勢確認轉多');
+    if(rsi)result.details.push('RSI:'+rsi.toFixed(1));
     return result;
   }
-  // RSI超買+回落
-  if(rsi>70&&rsi<rsiPrev){
-    var s2=3;
-    if(rsi>75)s2++;
-    if(boll&&cur>boll.upper)s2++;
-    if(rsiPrev-rsi>2)s2++;
-    result.signal='SELL';result.pattern='RSI超買反轉';result.strength=s2;
-    result.details.push('RSI:'+rsi.toFixed(1)+' 超買回落');
-    if(boll&&cur>boll.upper)result.details.push('突破布林上軌');
+  // 大趨勢翻空：EMA21下穿EMA55
+  if(prevEma21>prevEma55&&ema21<ema55&&cur<ema21){
+    var s2=4;
+    if(rsi&&rsi<50&&rsi>30)s2++;
+    if(cur<ema55*0.99)s2++;
+    if(boll&&cur<boll.mid)s2++;
+    result.signal='SELL';result.pattern='長波趨勢翻空';result.strength=s2;
+    result.details.push('EMA21('+ema21.toFixed(4)+') 下穿 EMA55('+ema55.toFixed(4)+')');
+    result.details.push('大趨勢確認轉空');
+    if(rsi)result.details.push('RSI:'+rsi.toFixed(1));
+    return result;
+  }
+  // 長波回調做多：大趨勢多頭中回調到支撐
+  if(ema21>ema55&&cur<ema21&&Math.abs(cur-support)/support<0.02){
+    var s3=3;
+    if(rsi&&rsi<45)s3++;
+    if(boll&&cur<boll.lower)s3++;
+    result.signal='BUY';result.pattern='長波回調支撐';result.strength=s3;
+    result.details.push('多頭趨勢回調至支撐 '+support.toFixed(4));
+    if(rsi)result.details.push('RSI:'+rsi.toFixed(1));
+    return result;
+  }
+  // 長波反彈做空：大趨勢空頭中反彈到阻力
+  if(ema21<ema55&&cur>ema21&&Math.abs(cur-resistance)/resistance<0.02){
+    var s4=3;
+    if(rsi&&rsi>55)s4++;
+    if(boll&&cur>boll.upper)s4++;
+    result.signal='SELL';result.pattern='長波反彈阻力';result.strength=s4;
+    result.details.push('空頭趨勢反彈至阻力 '+resistance.toFixed(4));
+    if(rsi)result.details.push('RSI:'+rsi.toFixed(1));
     return result;
   }
   return result;
@@ -473,8 +521,8 @@ function analyzeBreakout(closes,highs,lows,vols){
 function runStrategy(b,closes,highs,lows,opens,vols){
   switch(b.strategyKey){
     case 'pinbar':return analyzePinBar(closes,highs,lows,opens);
-    case 'ema':return analyzeEMA(closes,highs,lows);
-    case 'rsi':return analyzeRSI(closes,highs,lows);
+    case 'shortwave':return analyzeShortWave(closes,highs,lows,opens,vols);
+    case 'longwave':return analyzeLongWave(closes,highs,lows,opens,vols);
     case 'boll':return analyzeBoll(closes,highs,lows);
     case 'breakout':return analyzeBreakout(closes,highs,lows,vols);
     default:return{signal:'NONE',pattern:'',strength:0,details:[]};
@@ -528,7 +576,7 @@ async function checkPositions(b){
         await ax.cancelAllOrders(t.symbol,ps);
         tgBot(b,'['+b.emoji+b.name+'] '+(pnl>=0?'✅':'❌')+' '+t.symbol+'\nPnL:'+(pnl>=0?'+':'')+pnl.toFixed(4)+'U Hold:'+holdMin+'min');
         // 交流平台廣播
-        broadcastToAdmin(b.name+(pnl>=0?' ✅ 獲利 ':' ❌ 虧損 ')+t.symbol+' PnL:'+(pnl>=0?'+':'')+pnl.toFixed(4)+'U');
+        broadcastToAdmin(b.emoji+b.name+(pnl>=0?' ✅ 獲利 ':' ❌ 虧損 ')+t.symbol+' PnL:'+(pnl>=0?'+':'')+pnl.toFixed(4)+'U Hold:'+holdMin+'min');
         saveBots();
         continue;
       }
@@ -656,7 +704,10 @@ async function tradingLoopUser(b){
           log('OK',sym+' 開單 '+sig.signal+' @'+cur,b);
 
           // 交流平台廣播開單訊息
-          broadcastToAdmin(b.emoji+b.name+' 開倉 '+(sig.signal==='BUY'?'🟢':'🔴')+sym+' 理由:'+sig.pattern);
+          var openMsg=b.emoji+b.name+' 開倉 '+(sig.signal==='BUY'?'🟢 多':'🔴 空')+' '+sym+'\n理由: '+sig.pattern+'\n強度: '+sig.strength+'/8';
+          broadcastToAdmin(openMsg);
+          // 自動發起討論（不阻塞主流程）
+          setTimeout(function(){botDiscuss(b,'我剛開了'+sym+(sig.signal==='BUY'?'多單':'空單')+'，你們怎麼看？',sym).catch(function(){});},3000);
         }
       }catch(e){log('ERROR',sym+': '+e.message,b);}
     }
@@ -690,15 +741,68 @@ function recordTrade(b,t){
 // ══════════════════════════════════
 // 交流平台
 // ══════════════════════════════════
-function broadcastToAdmin(msg){
+function broadcastToAdmin(msg,silent){
   sharedMsg.push({ts:nowTW(),msg:msg});
-  if(sharedMsg.length>100)sharedMsg.shift();
-  // 發送到管理員（海馬Bot）
-  if(ADMIN_TOKEN&&ADMIN_CHAT){
-    var body=JSON.stringify({chat_id:ADMIN_CHAT,text:'💬 交易室\n'+msg});
+  if(sharedMsg.length>200)sharedMsg.shift();
+  // silent=true 只存不發通知，避免洗版
+  if(!silent&&ADMIN_TOKEN&&ADMIN_CHAT){
+    var body=JSON.stringify({chat_id:ADMIN_CHAT,text:'💬 '+msg});
     var req=https.request({hostname:'api.telegram.org',path:'/bot'+ADMIN_TOKEN+'/sendMessage',method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}},function(){});
     req.on('error',function(){});req.write(body);req.end();
   }
+}
+
+// ✅ AI Bot 互相討論
+async function botDiscuss(triggerBot,topic,sym){
+  // 每個Bot用AI生成觀點，發到聊天窗
+  var allBots=Object.values(bots).filter(function(b){return b.cfg&&b.cfg.botRunning;});
+  if(!allBots.length)return;
+  broadcastToAdmin('━━━━━━━━━━━━━━━\n📢 '+triggerBot.emoji+triggerBot.name+' 發起討論\n主題: '+topic+(sym?' ['+sym+']':'')+' \n━━━━━━━━━━━━━━━');
+  await new Promise(function(r){setTimeout(r,1000);});
+  for(var i=0;i<allBots.length;i++){
+    var b=allBots[i];
+    try{
+      var ax=api(b);
+      var marketCtx='';
+      if(sym){
+        var tf=STRATEGIES[b.strategyKey]&&STRATEGIES[b.strategyKey].tf||'1h';
+        var kl=await ax.getKlines(sym,tf,30).catch(function(){return[];});
+        if(kl&&kl.length>=10){
+          var closes=kl.map(function(k){return parseFloat(k.close||k[4]||0);});
+          var highs=kl.map(function(k){return parseFloat(k.high||k[2]||0);});
+          var lows=kl.map(function(k){return parseFloat(k.low||k[3]||0);});
+          var opens=kl.map(function(k){return parseFloat(k.open||k[1]||0);});
+          var vols=kl.map(function(k){return parseFloat(k.volume||k[5]||0);});
+          var rsi=I.rsi(closes,14);
+          var ema20=I.ema(closes,20);
+          var sig=runStrategy(b,closes,highs,lows,opens,vols);
+          marketCtx=sym+'現價:'+closes[closes.length-1].toFixed(4);
+          if(rsi)marketCtx+=' RSI:'+rsi.toFixed(1);
+          if(ema20)marketCtx+=' EMA20:'+ema20.toFixed(4);
+          if(sig.signal!=='NONE')marketCtx+=' 我的訊號:'+sig.signal+'('+sig.pattern+')';
+        }
+      }
+      var prompt='你是'+b.name+'，專業的'+b.strategy+'交易員。'+
+        '用你的策略視角，針對討論主題給出簡短專業的看法（50字以內）。'+
+        '語氣要有個性，可以同意或反對其他人的看法。'+
+        '只說重點，不用客套話。'+
+        (marketCtx?'\n當前數據: '+marketCtx:'');
+      var body=JSON.stringify({
+        model:'llama-3.3-70b-versatile',max_tokens:150,
+        messages:[{role:'system',content:prompt},{role:'user',content:topic}]
+      });
+      var response=await new Promise(function(resolve,reject){
+        var req=https.request({hostname:'api.groq.com',path:'/openai/v1/chat/completions',method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+GROQ_KEY}},function(res){
+          var d='';res.on('data',function(c){d+=c;});
+          res.on('end',function(){try{var r=JSON.parse(d);resolve(r.choices&&r.choices[0]?r.choices[0].message.content:'...');}catch(e){resolve('...');}});
+        });
+        req.on('error',function(){resolve('...');});req.write(body);req.end();
+      });
+      broadcastToAdmin(b.emoji+' '+b.name+':\n'+response);
+      await new Promise(function(r){setTimeout(r,1500);});
+    }catch(e){log('ERROR','討論失敗 '+b.name+': '+e.message);}
+  }
+  broadcastToAdmin('━━━━━━━━━━━━━━━\n討論結束');
 }
 
 // ══════════════════════════════════
@@ -966,7 +1070,7 @@ function handleAdminCmd(update){
   log('INFO','管理員: '+cmd);
 
   if(cmd==='/help'){
-    tgAdmin('👑 海馬管理指令\n\n【查看】\n/bots - 所有Bot狀態\n/ranking - 即時排名\n/report - 即時績效報告\n/chat - 近期交易室訊息\n/log - 系統日誌\n\n【控制】\n/startall - 啟動所有Bot\n/stopall - 停止所有Bot\n/broadcast [訊息] - 廣播\n\n【改進方案】\n/improvements - 查看所有方案\n/approve [策略名] - 批准\n/reject [策略名] [原因] - 拒絕\n\n【新增Bot】\n(系統已預設5個Bot)');return;
+    tgAdmin('👑 海馬管理指令\n\n【查看】\n/bots - 所有Bot狀態\n/ranking - 即時排名\n/report - 即時績效報告\n/chat - 交易室訊息\n/log - 系統日誌\n\n【討論】\n/discuss DOGE - 召開幣種分析會議\n/meeting - 每日市場會議\n\n【控制】\n/startall - 啟動所有Bot\n/stopall - 停止所有Bot\n/broadcast [訊息] - 廣播\n\n【改進方案】\n/improvements - 查看所有方案\n/approve [策略名] - 批准\n/reject [策略名] [原因] - 拒絕');return;
   }
 
   if(cmd==='/bots'){
@@ -999,9 +1103,23 @@ function handleAdminCmd(update){
   }
 
   if(cmd==='/chat'){
-    var msgs=sharedMsg.slice(-15);
+    var msgs=sharedMsg.slice(-20);
     if(!msgs.length){tgAdmin('交易室目前沒有訊息');return;}
-    tgAdmin('💬 交易室近期訊息\n\n'+msgs.map(function(m){return '['+m.ts+'] '+m.msg;}).join('\n'));return;
+    tgAdmin('💬 交易室\n\n'+msgs.map(function(m){return m.msg;}).join('\n'));return;
+  }
+
+  if(cmd==='/discuss'&&parts[1]){
+    var sym2=parts[1].toUpperCase();
+    if(!sym2.endsWith('-USDT'))sym2+='-USDT';
+    tgAdmin('💬 召開 '+sym2+' 分析會議...');
+    var trigBot=Object.values(bots)[0];
+    botDiscuss(trigBot,'請分析 '+sym2+' 目前的走勢和機會',sym2).catch(function(e){tgAdmin('錯誤: '+e.message);});return;
+  }
+
+  if(cmd==='/meeting'){
+    tgAdmin('💬 召開每日市場分析會議...');
+    var trigBot2=Object.values(bots)[0];
+    botDiscuss(trigBot2,'今天市場整體走勢如何？各自分享最看好的幣種',null).catch(function(e){tgAdmin('錯誤: '+e.message);});return;
   }
 
   if(cmd==='/log'){
