@@ -15,12 +15,12 @@ const STATS_FILE = '/home/ubuntu/breakout_stats.json';
 // ══════════════════════════════════
 // 系統參數
 // ══════════════════════════════════
-const INITIAL_CAPITAL   = 50;    // 初始資金 U
-const ORDER_AMT         = 1;     // 每單開倉金額 U
-const MAX_POSITIONS     = 5;     // 最多同時持倉
-const LEVERAGE          = 5;     // 槓桿倍數
-const MAX_LOSS_PCT      = 0.01;  // 正常止損 1% of 開倉金額
-const MAX_LOSS_MARGIN   = 0.90;  // 翻倉模式最大止損 90% of 開倉金額
+const INITIAL_CAPITAL   = 50;
+const ORDER_AMT         = 1;
+const MAX_POSITIONS     = 5;
+const LEVERAGE          = 5;
+const MAX_LOSS_PCT      = 0.01;
+const MAX_LOSS_MARGIN   = 0.90;
 const TP1_RR            = 1.0;
 const TP2_RR            = 2.0;
 const TP3_RR            = 3.0;
@@ -71,6 +71,39 @@ function nowTW() { return new Date().toLocaleString('zh-TW', { timeZone: 'Asia/T
 function hourTW() { return parseInt(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei', hour: 'numeric', hour12: false })); }
 function log(lv, msg) { console.log(`[${nowTW()}][${lv}] ${msg}`); }
 function winRate() { return stats.total === 0 ? 0 : stats.wins / stats.total; }
+
+function fmt(n, d) {
+  d = d || 4;
+  if (n >= 1000) return n.toFixed(2);
+  if (n >= 1)    return n.toFixed(3);
+  return n.toFixed(d);
+}
+
+// 進場強度評分（1-5星）
+function calcStrength(sykes, breakout) {
+  let score = 0;
+
+  // 量比（最高2分）
+  if (sykes.volRatio >= 2.0) score += 2;
+  else if (sykes.volRatio >= 1.5) score += 1;
+
+  // Wyckoff確認（1分）
+  if (sykes.wyckoff !== 0) score += 1;
+
+  // EMA排列緊密度（1分）
+  const spread = Math.abs(breakout.ema9 - breakout.ema20) / breakout.ema200;
+  if (spread < 0.01) score += 1; // EMA靠近，排列剛形成
+
+  // 結構突破幅度（1分）
+  const breakPct = Math.abs(breakout.prevClose - (breakout.bullBreak ? breakout.structHigh : breakout.structLow)) / breakout.curClose;
+  if (breakPct > 0.005) score += 1; // 突破超過0.5%
+
+  return Math.min(score, 5);
+}
+
+function stars(n) {
+  return '⭐'.repeat(n) + '☆'.repeat(5 - n);
+}
 
 // ══════════════════════════════════
 // BingX API
@@ -183,33 +216,29 @@ function calcSykes(klines) {
   const len     = closes.length;
   const last    = len - 1;
 
-  // 量能分析
-  const volMA    = volumes.slice(-20).reduce((s, v) => s + v, 0) / 20;
-  const curVol   = volumes[last];
-  const volRatio = curVol / volMA;
-  const isUp     = closes[last] > opens[last];
-  const volScore = isUp ? volRatio : -volRatio;
+  const volMA      = volumes.slice(-20).reduce((s, v) => s + v, 0) / 20;
+  const curVol     = volumes[last];
+  const volRatio   = curVol / volMA;
+  const isUp       = closes[last] > opens[last];
+  const volScore   = isUp ? volRatio : -volRatio;
 
-  // Wyckoff 結構
-  const lookback     = Math.min(50, len);
-  const recentHighs  = highs.slice(-lookback);
-  const recentLows   = lows.slice(-lookback);
+  const lookback      = Math.min(50, len);
+  const recentHighs   = highs.slice(-lookback);
+  const recentLows    = lows.slice(-lookback);
   const structureHigh = Math.max(...recentHighs);
   const structureLow  = Math.min(...recentLows);
-  const range        = structureHigh - structureLow;
+  const range         = structureHigh - structureLow;
   if (range === 0) return null;
 
   const curClose   = closes[last];
   const posInRange = (curClose - structureLow) / range;
 
-  // Spring（吸籌完成）
-  const nearBottom  = posInRange < 0.3;
-  const prevLow5    = Math.min(...lows.slice(-6, -1));
-  const springTest  = lows[last] <= prevLow5 * 1.002;
-  const rebound     = closes[last] > opens[last];
+  const nearBottom   = posInRange < 0.3;
+  const prevLow5     = Math.min(...lows.slice(-6, -1));
+  const springTest   = lows[last] <= prevLow5 * 1.002;
+  const rebound      = closes[last] > opens[last];
   const volExpansion = curVol > volMA * 1.2;
 
-  // UTAD（派發完成）
   const nearTop    = posInRange > 0.7;
   const prevHigh5  = Math.max(...highs.slice(-6, -1));
   const utadTest   = highs[last] >= prevHigh5 * 0.998;
@@ -232,7 +261,7 @@ function calcSykes(klines) {
 }
 
 // ══════════════════════════════════
-// 突破條件（EMA排列 + 結構突破 + 等K線收盤）
+// 突破條件
 // ══════════════════════════════════
 function calcBreakout(klines) {
   if (klines.length < 210) return null;
@@ -249,12 +278,11 @@ function calcBreakout(klines) {
   if (!ema9 || !ema20 || !ema50 || !ema200) return null;
 
   const curClose  = closes[last];
-  const prevClose = closes[last - 1]; // 已收盤的K線收盤價
+  const prevClose = closes[last - 1];
 
   const bullAlign = ema9 > ema20 && ema20 > ema50 && ema50 > ema200 && curClose > ema9;
   const bearAlign = ema9 < ema20 && ema20 < ema50 && ema50 < ema200 && curClose < ema9;
 
-  // 用前一根已收盤K線判斷突破
   const recent20Highs = highs.slice(-22, -2);
   const recent20Lows  = lows.slice(-22, -2);
   const structHigh    = Math.max(...recent20Highs);
@@ -274,9 +302,6 @@ function calcBreakout(klines) {
   };
 }
 
-// ══════════════════════════════════
-// 開單條件
-// ══════════════════════════════════
 function checkSignal(sykes, breakout) {
   if (!sykes || !breakout) return null;
   if (sykes.longSignal  && breakout.bullBreak) return 'LONG';
@@ -288,8 +313,8 @@ function checkSignal(sykes, breakout) {
 // 計算止盈止損
 // ══════════════════════════════════
 function calcLevels(side, entryPrice, atr, flipMode) {
-  const slPct  = flipMode ? MAX_LOSS_MARGIN : MAX_LOSS_PCT;
-  const slDist = entryPrice * slPct;
+  const slPct   = flipMode ? MAX_LOSS_MARGIN : MAX_LOSS_PCT;
+  const slDist  = entryPrice * slPct;
   const atrDist = atr ? atr * 1.5 : slDist;
   const useDist = flipMode ? Math.max(slDist, atrDist * 3) : Math.max(slDist, atrDist);
 
@@ -306,11 +331,11 @@ function calcLevels(side, entryPrice, atr, flipMode) {
     tp3 = entryPrice - useDist * TP3_RR;
   }
 
-  return { sl, tp1, tp2, tp3 };
+  return { sl, tp1, tp2, tp3, dist: useDist };
 }
 
 // ══════════════════════════════════
-// 設定槓桿與保證金模式
+// 設定槓桿
 // ══════════════════════════════════
 async function setLeverage(symbol, lev, flipMode) {
   const marginType = flipMode ? 'CROSSED' : 'ISOLATED';
@@ -332,9 +357,7 @@ async function placeOrder(symbol, side, sl, tp1, flipMode) {
   const notional     = ORDER_AMT * LEVERAGE;
 
   const r = await bxReq('POST', '/openApi/swap/v2/trade/order', {
-    symbol,
-    side: orderSide,
-    positionSide,
+    symbol, side: orderSide, positionSide,
     type: 'MARKET',
     quoteOrderQty: String(notional)
   });
@@ -349,7 +372,6 @@ async function placeOrder(symbol, side, sl, tp1, flipMode) {
 
   if (qty <= 0) throw new Error('開倉數量為0');
 
-  // 止損
   await bxReq('POST', '/openApi/swap/v2/trade/order', {
     symbol, side: closeSide, positionSide,
     type: 'STOP_MARKET',
@@ -358,7 +380,6 @@ async function placeOrder(symbol, side, sl, tp1, flipMode) {
     workingType: 'MARK_PRICE'
   }).catch(e => log('WARN', `SL設定失敗: ${e.message}`));
 
-  // TP1（1/3倉位）
   const tp1Qty = parseFloat((qty * TP_RATIO).toFixed(6));
   await bxReq('POST', '/openApi/swap/v2/trade/order', {
     symbol, side: closeSide, positionSide,
@@ -372,7 +393,7 @@ async function placeOrder(symbol, side, sl, tp1, flipMode) {
 }
 
 // ══════════════════════════════════
-// 同步持倉（重啟恢復）
+// 同步持倉
 // ══════════════════════════════════
 async function syncPositions() {
   try {
@@ -381,7 +402,6 @@ async function syncPositions() {
 
     const apiPos = (r.data || []).filter(p => parseFloat(p.positionAmt || 0) !== 0);
 
-    // 清除已不存在的
     for (const sym of Object.keys(positions)) {
       if (!apiPos.find(p => p.symbol === sym)) {
         log('INFO', `持倉結束，清除: ${sym}`);
@@ -389,12 +409,11 @@ async function syncPositions() {
       }
     }
 
-    // 恢復不在記憶體的持倉
     for (const p of apiPos) {
       if (!positions[p.symbol]) {
-        const side = parseFloat(p.positionAmt) > 0 ? 'LONG' : 'SHORT';
+        const side       = parseFloat(p.positionAmt) > 0 ? 'LONG' : 'SHORT';
         const entryPrice = parseFloat(p.avgPrice || 0);
-        const qty = Math.abs(parseFloat(p.positionAmt));
+        const qty        = Math.abs(parseFloat(p.positionAmt));
         log('INFO', `恢復持倉: ${p.symbol} ${side} @${entryPrice}`);
         positions[p.symbol] = {
           side, entryPrice, qty,
@@ -413,11 +432,10 @@ async function syncPositions() {
 }
 
 // ══════════════════════════════════
-// 讀取真實PnL（從API）
+// 真實PnL
 // ══════════════════════════════════
 async function getRealPnl(symbol, openTime) {
   try {
-    // 注意：BingX income API 不帶 symbol，全部取回再過濾
     const r = await bxReq('GET', '/openApi/swap/v2/user/income', {
       limit: 50,
       startTime: String(openTime)
@@ -437,7 +455,7 @@ async function getRealPnl(symbol, openTime) {
 }
 
 // ══════════════════════════════════
-// 翻倉模式管理
+// 翻倉模式
 // ══════════════════════════════════
 function checkFlipMode() {
   const wr  = winRate();
@@ -455,7 +473,7 @@ function checkFlipMode() {
 }
 
 // ══════════════════════════════════
-// 結單處理
+// 結單
 // ══════════════════════════════════
 async function onPositionClosed(symbol, pos, reason) {
   await new Promise(res => setTimeout(res, 3000));
@@ -467,9 +485,8 @@ async function onPositionClosed(symbol, pos, reason) {
   if (win) stats.wins++; else stats.losses++;
   if (pnl !== null) { stats.pnl += pnl; stats.capital += pnl; }
 
-  // AI學習
   const hour = new Date(pos.openTime).getHours();
-  if (!stats.hourPerf[hour])    stats.hourPerf[hour]    = { total: 0, wins: 0, pnl: 0 };
+  if (!stats.hourPerf[hour])     stats.hourPerf[hour]     = { total: 0, wins: 0, pnl: 0 };
   if (!stats.symbolPerf[symbol]) stats.symbolPerf[symbol] = { total: 0, wins: 0, pnl: 0 };
   stats.hourPerf[hour].total++;
   stats.symbolPerf[symbol].total++;
@@ -490,11 +507,17 @@ async function onPositionClosed(symbol, pos, reason) {
   saveStats();
   checkFlipMode();
 
-  const pnlStr = pnl !== null ? (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + 'U' : 'N/A';
+  const pnlStr  = pnl !== null ? (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + 'U' : 'N/A';
+  const holdMin = Math.round((Date.now() - pos.openTime) / 60000);
+
   tg(
     `${win ? '✅' : '❌'} *${symbol}* 結單\n` +
-    `方向: ${pos.side} | 原因: ${reason}\n` +
+    `━━━━━━━━━━━━━━━━\n` +
+    `方向: ${pos.side === 'LONG' ? '做多 📈' : '做空 📉'}\n` +
+    `原因: ${reason}\n` +
     `PnL: ${pnlStr}\n` +
+    `持倉: ${holdMin}分鐘\n` +
+    `━━━━━━━━━━━━━━━━\n` +
     `資金: ${stats.capital.toFixed(2)}U\n` +
     `勝率: ${(winRate()*100).toFixed(1)}% (${stats.wins}/${stats.total})\n` +
     `翻倉: ${stats.flipMode ? '✅全倉' : '❌逐倉'}`
@@ -502,7 +525,7 @@ async function onPositionClosed(symbol, pos, reason) {
 }
 
 // ══════════════════════════════════
-// 監控持倉（TP2/TP3）
+// 監控持倉
 // ══════════════════════════════════
 async function monitorPositions() {
   for (const symbol of Object.keys(positions)) {
@@ -520,16 +543,15 @@ async function monitorPositions() {
 
       const curQty    = Math.abs(parseFloat(apiPos.positionAmt));
       const markPrice = parseFloat(apiPos.markPrice || 0);
+      const unrealPnl = parseFloat(apiPos.unrealizedProfit || 0);
       const closeSide = pos.side === 'LONG' ? 'SELL' : 'BUY';
 
-      // TP1達成偵測
       if (!pos.tp1Done && curQty < pos.qty * 0.9) {
         pos.tp1Done = true;
         log('INFO', `${symbol} TP1達成`);
-        tg(`🎯 *${symbol}* TP1達成 @${markPrice}`);
+        tg(`🎯 *${symbol}* TP1達成\n價格: ${fmt(markPrice)}\n未實現PnL: ${unrealPnl >= 0 ? '+' : ''}${unrealPnl.toFixed(4)}U`);
       }
 
-      // TP2
       if (pos.tp1Done && !pos.tp2Done && pos.tp2 > 0) {
         const tp2Hit = pos.side === 'LONG' ? markPrice >= pos.tp2 : markPrice <= pos.tp2;
         if (tp2Hit) {
@@ -539,11 +561,10 @@ async function monitorPositions() {
             type: 'MARKET', quantity: String(tp2Qty)
           }).catch(e => log('WARN', `TP2失敗: ${e.message}`));
           pos.tp2Done = true;
-          tg(`🎯 *${symbol}* TP2達成 @${markPrice}`);
+          tg(`🎯 *${symbol}* TP2達成\n價格: ${fmt(markPrice)}`);
         }
       }
 
-      // TP3（全部出場）
       if (pos.tp2Done && pos.tp3 > 0) {
         const tp3Hit = pos.side === 'LONG' ? markPrice >= pos.tp3 : markPrice <= pos.tp3;
         if (tp3Hit) {
@@ -551,13 +572,13 @@ async function monitorPositions() {
             symbol, side: closeSide, positionSide: pos.side,
             type: 'MARKET', quantity: String(curQty)
           }).catch(e => log('WARN', `TP3失敗: ${e.message}`));
-          tg(`🎯 *${symbol}* TP3達成 @${markPrice} 全部出場`);
+          tg(`🎯 *${symbol}* TP3達成 @${fmt(markPrice)} 全部出場`);
           await onPositionClosed(symbol, pos, 'TP3');
         }
       }
 
     } catch(e) {
-      log('ERROR', `監控 ${symbol} 失敗: ${e.message}`);
+      log('ERROR', `監控 ${symbol}: ${e.message}`);
     }
   }
 }
@@ -590,13 +611,10 @@ async function scan() {
         const klines = await getKlines(symbol, TF, 210);
         if (klines.length < 210) continue;
 
-        // 確認最後K線已收盤
         const lastK      = klines[klines.length - 1];
         const klineTs    = parseInt(lastK[0]);
         const klineEndTs = klineTs + 3600000;
         if (Date.now() < klineEndTs) continue;
-
-        // 避免同K線重複
         if (lastCandle[symbol] === klineTs) continue;
 
         const sykes    = calcSykes(klines);
@@ -606,7 +624,10 @@ async function scan() {
 
         lastCandle[symbol] = klineTs;
 
-        const { sl, tp1, tp2, tp3 } = calcLevels(signal, breakout.curClose, breakout.atr, stats.flipMode);
+        const { sl, tp1, tp2, tp3, dist } = calcLevels(signal, breakout.curClose, breakout.atr, stats.flipMode);
+        const strength = calcStrength(sykes, breakout);
+        const slPct    = (dist / breakout.curClose * 100).toFixed(2);
+        const atrMult  = breakout.atr ? (dist / breakout.atr).toFixed(1) : 'N/A';
 
         try {
           const { orderId, entryPrice, qty } = await placeOrder(symbol, signal, sl, tp1, stats.flipMode);
@@ -621,14 +642,32 @@ async function scan() {
 
           saveStats();
 
+          const slDist  = Math.abs(entryPrice - sl);
+          const slPctR  = (slDist / entryPrice * 100).toFixed(2);
+          const tp1Dist = Math.abs(tp1 - entryPrice);
+          const tp2Dist = Math.abs(tp2 - entryPrice);
+          const tp3Dist = Math.abs(tp3 - entryPrice);
+          const maxLoss = (ORDER_AMT * (stats.flipMode ? MAX_LOSS_MARGIN : MAX_LOSS_PCT)).toFixed(4);
+
           tg(
             `🚀 *開倉* ${symbol}\n` +
+            `━━━━━━━━━━━━━━━━\n` +
             `方向: ${signal === 'LONG' ? '做多 📈' : '做空 📉'}\n` +
-            `進場: ${entryPrice.toFixed(4)}\n` +
-            `SL: ${sl.toFixed(4)}\n` +
-            `TP1: ${tp1.toFixed(4)} | TP2: ${tp2.toFixed(4)} | TP3: ${tp3.toFixed(4)}\n` +
-            `模式: ${stats.flipMode ? '全倉翻倉' : '逐倉'}\n` +
-            `Wyckoff: ${sykes.wyckoff === 1 ? '吸籌' : '派發'} | 量比: ${sykes.volRatio.toFixed(2)}`
+            `進場: ${fmt(entryPrice)}\n` +
+            `━━━━━━━━━━━━━━━━\n` +
+            `🛑 止損: ${fmt(sl)} (${signal === 'LONG' ? '-' : '+'}${fmt(slDist)} / -${slPctR}%)\n` +
+            `🎯 TP1:  ${fmt(tp1)} (+${fmt(tp1Dist)}) RR 1:1\n` +
+            `🎯 TP2:  ${fmt(tp2)} (+${fmt(tp2Dist)}) RR 1:2\n` +
+            `🎯 TP3:  ${fmt(tp3)} (+${fmt(tp3Dist)}) RR 1:3\n` +
+            `━━━━━━━━━━━━━━━━\n` +
+            `💪 強度: ${stars(strength)} (${strength}/5)\n` +
+            `📊 Wyckoff: ${sykes.wyckoff === 1 ? '吸籌完成 Spring' : '派發完成 UTAD'}\n` +
+            `📈 量比: ${sykes.volRatio.toFixed(2)}x ${sykes.volRatio >= 2 ? '🔥放量' : sykes.volRatio >= 1.5 ? '量增' : '普通'}\n` +
+            `📉 EMA排列: ${signal === 'LONG' ? '完整多頭' : '完整空頭'}\n` +
+            `⚠️ 最大虧損: -${maxLoss}U\n` +
+            `━━━━━━━━━━━━━━━━\n` +
+            `模式: ${stats.flipMode ? '全倉翻倉' : '逐倉 1U'} | 槓桿: ${LEVERAGE}x\n` +
+            `持倉: ${Object.keys(positions).length}/${MAX_POSITIONS}`
           );
         } catch(e) {
           log('ERROR', `開倉失敗 ${symbol}: ${e.message}`);
@@ -690,50 +729,110 @@ async function pollTg() {
       const chatId = upd.message?.chat?.id;
       if (String(chatId) !== String(CHAT_ID)) continue;
 
-      if (text === '/status') {
-        const posLines = Object.keys(positions).map(s => {
-          const p = positions[s];
-          return `  ${s} ${p.side} @${p.entryPrice.toFixed(4)}`;
-        }).join('\n') || '  (無持倉)';
+      // ── /help ──
+      if (text === '/help') {
         tg(
-          `📊 *突破系統狀態*\n` +
-          `資金: ${stats.capital.toFixed(2)}U\n` +
-          `勝率: ${(winRate()*100).toFixed(1)}% (${stats.wins}/${stats.total})\n` +
-          `總PnL: ${stats.pnl >= 0 ? '+' : ''}${stats.pnl.toFixed(4)}U\n` +
-          `翻倉: ${stats.flipMode ? '✅全倉' : '❌逐倉'}\n` +
-          `持倉(${Object.keys(positions).length}/${MAX_POSITIONS}):\n${posLines}`
+          `📖 *突破系統指令列表*\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `/status   📊 系統狀態、持倉、資金\n` +
+          `/positions 📋 詳細持倉資訊\n` +
+          `/stats    🧠 AI學習統計\n` +
+          `/sync     🔄 同步持倉（重啟後用）\n` +
+          `/closeall ❌ 全部平倉\n` +
+          `/help     📖 顯示此說明\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `*自動通知*\n` +
+          `🚀 開倉（含進場強度/止損/止盈）\n` +
+          `🎯 TP1/TP2/TP3 達成\n` +
+          `✅/❌ 結單（含真實PnL）\n` +
+          `🔓/🔒 翻倉模式開關\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `*翻倉條件*\n` +
+          `開啟: 勝率≥60% + 資金≥100U\n` +
+          `關閉: 勝率<40%`
         );
       }
 
+      // ── /status ──
+      if (text === '/status') {
+        const posLines = Object.keys(positions).map(s => {
+          const p = positions[s];
+          return `  ${p.side === 'LONG' ? '📈' : '📉'} ${s} @${fmt(p.entryPrice)}`;
+        }).join('\n') || '  (無持倉)';
+
+        tg(
+          `📊 *突破系統狀態*\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `資金: ${stats.capital.toFixed(2)}U\n` +
+          `總PnL: ${stats.pnl >= 0 ? '+' : ''}${stats.pnl.toFixed(4)}U\n` +
+          `勝率: ${(winRate()*100).toFixed(1)}% (${stats.wins}勝/${stats.losses}敗)\n` +
+          `翻倉: ${stats.flipMode ? '✅全倉模式' : '❌逐倉模式'}\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `持倉 ${Object.keys(positions).length}/${MAX_POSITIONS}:\n${posLines}\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `下次翻倉開啟: 勝率${(winRate()*100).toFixed(1)}%/${(FLIP_WIN_RATE*100)}% 資金${stats.capital.toFixed(0)}U/${FLIP_CAPITAL}U`
+        );
+      }
+
+      // ── /positions ──
+      if (text === '/positions') {
+        if (Object.keys(positions).length === 0) {
+          tg('📋 目前無持倉');
+        } else {
+          for (const sym of Object.keys(positions)) {
+            const p = positions[sym];
+            const holdMin = Math.round((Date.now() - p.openTime) / 60000);
+            tg(
+              `📋 *${sym}*\n` +
+              `方向: ${p.side === 'LONG' ? '做多 📈' : '做空 📉'}\n` +
+              `進場: ${fmt(p.entryPrice)}\n` +
+              `止損: ${p.sl > 0 ? fmt(p.sl) : '未設定'}\n` +
+              `TP1: ${p.tp1 > 0 ? fmt(p.tp1) : '未設定'} ${p.tp1Done ? '✅' : '⏳'}\n` +
+              `TP2: ${p.tp2 > 0 ? fmt(p.tp2) : '未設定'} ${p.tp2Done ? '✅' : '⏳'}\n` +
+              `TP3: ${p.tp3 > 0 ? fmt(p.tp3) : '未設定'} ⏳\n` +
+              `持倉: ${holdMin}分鐘\n` +
+              `模式: ${p.flipMode ? '全倉' : '逐倉'}`
+            );
+          }
+        }
+      }
+
+      // ── /sync ──
       if (text === '/sync') {
         await syncPositions();
         tg(`✅ 持倉已同步\n目前: ${Object.keys(positions).length}個`);
       }
 
+      // ── /closeall ──
       if (text === '/closeall') {
-        for (const sym of Object.keys(positions)) {
-          const pos = positions[sym];
-          try {
-            const r2 = await bxReq('GET', '/openApi/swap/v2/user/positions', { symbol: sym });
-            if (r2.code === 0 && r2.data) {
-              const ap = r2.data.find(p => Math.abs(parseFloat(p.positionAmt || 0)) > 0);
-              if (ap) {
-                const qty = Math.abs(parseFloat(ap.positionAmt));
-                await bxReq('POST', '/openApi/swap/v2/trade/order', {
-                  symbol: sym,
-                  side: pos.side === 'LONG' ? 'SELL' : 'BUY',
-                  positionSide: pos.side,
-                  type: 'MARKET',
-                  quantity: String(qty)
-                });
-                await onPositionClosed(sym, pos, '手動全平');
+        if (Object.keys(positions).length === 0) {
+          tg('目前無持倉');
+        } else {
+          for (const sym of Object.keys(positions)) {
+            const pos = positions[sym];
+            try {
+              const r2 = await bxReq('GET', '/openApi/swap/v2/user/positions', { symbol: sym });
+              if (r2.code === 0 && r2.data) {
+                const ap = r2.data.find(p => Math.abs(parseFloat(p.positionAmt || 0)) > 0);
+                if (ap) {
+                  const qty = Math.abs(parseFloat(ap.positionAmt));
+                  await bxReq('POST', '/openApi/swap/v2/trade/order', {
+                    symbol: sym,
+                    side: pos.side === 'LONG' ? 'SELL' : 'BUY',
+                    positionSide: pos.side,
+                    type: 'MARKET',
+                    quantity: String(qty)
+                  });
+                  await onPositionClosed(sym, pos, '手動全平');
+                }
               }
-            }
-          } catch(e) { log('ERROR', `平倉失敗 ${sym}: ${e.message}`); }
+            } catch(e) { log('ERROR', `平倉失敗 ${sym}: ${e.message}`); }
+          }
+          tg('✅ 全部持倉已平');
         }
-        tg('✅ 全部持倉已平');
       }
 
+      // ── /stats ──
       if (text === '/stats') {
         const top = Object.entries(stats.symbolPerf)
           .filter(([, v]) => v.total >= 3)
@@ -741,7 +840,23 @@ async function pollTg() {
           .slice(0, 5)
           .map(([s, v]) => `  ${s}: ${v.wins}/${v.total} ${v.pnl >= 0 ? '+' : ''}${v.pnl.toFixed(2)}U`)
           .join('\n');
-        tg(`🧠 *AI學習統計*\n最佳幣種:\n${top || '資料不足'}`);
+
+        const worst = Object.entries(stats.symbolPerf)
+          .filter(([, v]) => v.total >= 3)
+          .sort((a, b) => a[1].pnl - b[1].pnl)
+          .slice(0, 3)
+          .map(([s, v]) => `  ${s}: ${v.wins}/${v.total} ${v.pnl.toFixed(2)}U`)
+          .join('\n');
+
+        tg(
+          `🧠 *AI學習統計*\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `總交易: ${stats.total} | 勝率: ${(winRate()*100).toFixed(1)}%\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `🏆 最佳幣種:\n${top || '  資料不足(需3筆以上)'}\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `⚠️ 最差幣種:\n${worst || '  資料不足'}`
+        );
       }
     }
   } catch(e) {}
@@ -756,10 +871,13 @@ async function main() {
 
   tg(
     `🟢 *突破系統啟動*\n` +
+    `━━━━━━━━━━━━━━━━\n` +
     `資金: ${stats.capital.toFixed(2)}U\n` +
     `持倉: ${Object.keys(positions).length}個\n` +
     `翻倉: ${stats.flipMode ? '✅全倉' : '❌逐倉'}\n` +
-    `勝率: ${(winRate()*100).toFixed(1)}% (${stats.wins}/${stats.total})`
+    `勝率: ${(winRate()*100).toFixed(1)}% (${stats.wins}/${stats.total})\n` +
+    `━━━━━━━━━━━━━━━━\n` +
+    `發送 /help 查看指令`
   );
 
   setInterval(scan, SCAN_INTERVAL_MS);
