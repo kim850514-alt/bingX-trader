@@ -1,691 +1,1099 @@
 'use strict';
+const https = require('https');
 const crypto = require('node:crypto');
-const https  = require('https');
-const fs     = require('fs');
+const fs = require('fs');
+const http = require('http');
 
-// ══════════════════════════════════
-// 系統設定
-// ══════════════════════════════════
-const BOT_TOKEN  = process.env.BOT_TOKEN  || '8760052481:AAHo8XWWwgkBJ9a2KuIOCcJJpUGBFQPTwwk';
-const CHAT_ID    = process.env.CHAT_ID    || '8308748755';
-const BX_KEY     = process.env.BX_APIKEY || 'IDrcq954PuXoImAK1U4MEC9sI9HLK2B9PSuctuib9u7maCsZdAMRp7u99uHrPfeErNxDBA4SoOYC54DLfKHQ';
-const BX_SECRET  = process.env.BX_SECRET || 'NqpQkRZMwqhzKVcxiC5gECYSGgrZoVhyRKisWBxkQEVsIBxu4iEdtMjCEX174eHFcAfzHT3x9biX8XtcjeJIQ';
-const STATS_FILE = '/home/ubuntu/breakout_stats.json';
+// ══════════════════════════════════════════════════
+// 環境設定
+// ══════════════════════════════════════════════════
+const BX_KEY    = process.env.BX_KEY    || 'YOUR_BINGX_API_KEY';
+const BX_SECRET = process.env.BX_SECRET || 'YOUR_BINGX_SECRET';
+const BOT_TOKEN = process.env.BOT_TOKEN || 'YOUR_TELEGRAM_BOT_TOKEN';
+const CHAT_ID   = process.env.CHAT_ID   || 'YOUR_TELEGRAM_CHAT_ID';
+const PORT      = process.env.PORT      || 3003;
+const STATE_FILE = '/home/ubuntu/hades_state.json';
 
-// ══════════════════════════════════
-// 系統參數
-// ══════════════════════════════════
-const INITIAL_CAPITAL   = 50;
-const ORDER_AMT         = 1;
-const MAX_POSITIONS     = 5;
-const LEVERAGE          = 5;
-const MAX_LOSS_PCT      = 0.01;
-const MAX_LOSS_MARGIN   = 0.90;
-const TP1_RR            = 1.0;
-const TP2_RR            = 2.0;
-const TP3_RR            = 3.0;
-const TP_RATIO          = 1/3;
-const FLIP_WIN_RATE     = 0.60;
-const FLIP_CAPITAL      = 100;
-const FLIP_OFF_WIN_RATE = 0.40;
-const TOP_N_SYMBOLS     = 200;
-const TF                = '1h';
-const SCAN_INTERVAL_MS  = 60000;
-const TIME_BLOCK_START  = 2;
-const TIME_BLOCK_END    = 6;
-
-// ══════════════════════════════════
-// 狀態
-// ══════════════════════════════════
-let stats     = loadStats();
-let positions = {};
-let lastCandle= {};
-let scanning  = false;
-var memLog    = [];
-
-// ══════════════════════════════════
-// 持久化
-// ══════════════════════════════════
-function loadStats() {
-  if (fs.existsSync(STATS_FILE)) {
-    try { return JSON.parse(fs.readFileSync(STATS_FILE, 'utf8')); } catch(e) {}
-  }
-  return { capital: INITIAL_CAPITAL, total: 0, wins: 0, losses: 0, pnl: 0, flipMode: false, trades: [], symbolPerf: {}, hourPerf: {} };
+// ══════════════════════════════════════════════════
+// 工具函數
+// ══════════════════════════════════════════════════
+function ts() {
+  return new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
 }
-function saveStats() { fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2)); }
-
-// ══════════════════════════════════
-// 工具
-// ══════════════════════════════════
-function nowTW()  { return new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }); }
-function hourTW() { return parseInt(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei', hour: 'numeric', hour12: false })); }
-function log(lv, msg) {
-  var line = '[' + nowTW() + '][' + lv + '] ' + msg;
-  console.log(line);
-  memLog.push({ ts: nowTW(), lv: lv, msg: msg });
-  if (memLog.length > 300) memLog.shift();
+function log(level, msg) {
+  console.log(`[${ts()}][HADES][${level}] ${msg}`);
 }
-function winRate() { return stats.total === 0 ? 0 : stats.wins / stats.total; }
-function fmt(n) { if (!n) return '0'; if (n >= 1000) return n.toFixed(2); if (n >= 1) return n.toFixed(3); return n.toFixed(4); }
-function stars(n) { return '⭐'.repeat(n) + '☆'.repeat(5 - n); }
-
-function calcStrength(sykes, breakout) {
-  var score = 0;
-  if (sykes.volRatio >= 2.0) score += 2;
-  else if (sykes.volRatio >= 1.5) score += 1;
-  if (sykes.wyckoff !== 0) score += 1;
-  var spread = Math.abs(breakout.ema9 - breakout.ema20) / breakout.ema200;
-  if (spread < 0.01) score += 1;
-  var ref = breakout.bullBreak ? breakout.structHigh : breakout.structLow;
-  var breakPct = Math.abs(breakout.prevClose - ref) / breakout.curClose;
-  if (breakPct > 0.005) score += 1;
-  return Math.min(score, 5);
+function hourTW() {
+  return (new Date().getUTCHours() + 8) % 24;
+}
+function todayKey() {
+  return new Date().toISOString().slice(0, 10).replace(/-/g, '');
+}
+function round(n, d) {
+  return parseFloat(n.toFixed(d));
+}
+function pct(a, b) {
+  return ((a - b) / b * 100).toFixed(2);
 }
 
-// ══════════════════════════════════
-// Telegram 發送
-// ══════════════════════════════════
-function tg(text) {
-  if (!BOT_TOKEN || !CHAT_ID) return;
-  var body = JSON.stringify({ chat_id: CHAT_ID, text: text, parse_mode: 'Markdown' });
-  var req = https.request({
-    hostname: 'api.telegram.org',
-    path: '/bot' + BOT_TOKEN + '/sendMessage',
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-  }, function(res) {
-    var d = '';
-    res.on('data', function(c) { d += c; });
-    res.on('end', function() {
-      try { var r = JSON.parse(d); if (!r.ok) log('WARN', 'TG錯誤: ' + d.slice(0, 100)); } catch(e) {}
-    });
-  });
-  req.on('error', function(e) { log('WARN', 'TG send: ' + e.message); });
-  req.write(body);
-  req.end();
+// ══════════════════════════════════════════════════
+// 狀態管理
+// ══════════════════════════════════════════════════
+function defaultState() {
+  return {
+    running: true,
+    capital: 50,
+    leverage: 5,
+    amount: 1,
+    allowShort: true,
+    maxPositions: 5,
+    maxSameDir: 3,
+    dailyLossPct: 5,
+    symbols: [],
+    openTrades: {},
+    slCooldown: {},
+    stats: {
+      allTime: { total: 0, wins: 0, losses: 0, pnl: 0 },
+      daily: {},
+      trades: []
+    }
+  };
 }
 
-// ══════════════════════════════════
-// Telegram 輪詢（callback遞迴，穩定版）
-// ══════════════════════════════════
-var lastUpdateId = 0;
-function tgPoll() {
-  if (!BOT_TOKEN) return;
-  var req = https.request({
-    hostname: 'api.telegram.org',
-    path: '/bot' + BOT_TOKEN + '/getUpdates?offset=' + (lastUpdateId + 1) + '&timeout=30&limit=10',
-    method: 'GET'
-  }, function(res) {
-    var d = '';
-    res.on('data', function(c) { d += c; });
-    res.on('end', function() {
-      try {
-        var json = JSON.parse(d);
-        if (json.ok && json.result && json.result.length > 0) {
-          json.result.forEach(function(u) {
-            if (u.update_id > lastUpdateId) lastUpdateId = u.update_id;
-            handleUpdate(u);
-          });
-        }
-      } catch(e) {}
-      setTimeout(tgPoll, 1000);
-    });
-  });
-  req.on('error', function(e) { log('WARN', 'TG poll: ' + e.message); setTimeout(tgPoll, 5000); });
-  req.setTimeout(35000, function() { req.destroy(); setTimeout(tgPoll, 1000); });
-  req.end();
+function loadState() {
+  if (fs.existsSync(STATE_FILE)) {
+    try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch(e) {}
+  }
+  return defaultState();
 }
 
-// ══════════════════════════════════
-// Telegram 指令處理
-// ══════════════════════════════════
-function handleUpdate(update) {
-  var msg = update.message || update.edited_message;
-  if (!msg) return;
-  var chatId = String(msg.chat.id);
-  var text   = (msg.text || '').trim();
-  log('INFO', 'TG收到 chatId=' + chatId + ' text=' + text);
-
-  if (text === '/help' || text === '/start') {
-    tg(
-      '🚀 *突破系統指令*\n' +
-      '━━━━━━━━━━━━━━━━\n' +
-      '/status    📊 系統狀態\n' +
-      '/positions 📋 詳細持倉\n' +
-      '/stats     🧠 AI學習統計\n' +
-      '/log       📝 最近日誌\n' +
-      '/sync      🔄 同步持倉\n' +
-      '/closeall  ❌ 全部平倉\n' +
-      '/help      📖 指令說明\n' +
-      '━━━━━━━━━━━━━━━━\n' +
-      '*自動通知*\n' +
-      '🚀 開倉（進場強度/止損/止盈）\n' +
-      '🎯 TP1/TP2/TP3 達成\n' +
-      '✅❌ 結單（含真實PnL）\n' +
-      '🔓🔒 翻倉模式開關\n' +
-      '━━━━━━━━━━━━━━━━\n' +
-      '*翻倉條件*\n' +
-      '開啟: 勝率≥60% + 資金≥100U\n' +
-      '關閉: 勝率<40%'
-    );
-    return;
-  }
-
-  if (text === '/status') {
-    var posLines = Object.keys(positions).map(function(s) {
-      var p = positions[s];
-      return '  ' + (p.side === 'LONG' ? '📈' : '📉') + ' ' + s + ' @' + fmt(p.entryPrice);
-    }).join('\n') || '  (無持倉)';
-    tg(
-      '📊 *突破系統狀態*\n' +
-      '━━━━━━━━━━━━━━━━\n' +
-      '資金: ' + stats.capital.toFixed(2) + 'U\n' +
-      '總PnL: ' + (stats.pnl >= 0 ? '+' : '') + stats.pnl.toFixed(4) + 'U\n' +
-      '勝率: ' + (winRate()*100).toFixed(1) + '% (' + stats.wins + '勝/' + stats.losses + '敗)\n' +
-      '翻倉: ' + (stats.flipMode ? '✅全倉' : '❌逐倉') + '\n' +
-      '━━━━━━━━━━━━━━━━\n' +
-      '持倉 ' + Object.keys(positions).length + '/' + MAX_POSITIONS + ':\n' + posLines
-    );
-    return;
-  }
-
-  if (text === '/positions') {
-    if (Object.keys(positions).length === 0) { tg('📋 目前無持倉'); return; }
-    Object.keys(positions).forEach(function(sym) {
-      var p = positions[sym];
-      var holdMin = Math.round((Date.now() - p.openTime) / 60000);
-      tg(
-        '📋 *' + sym + '*\n' +
-        '方向: ' + (p.side === 'LONG' ? '做多 📈' : '做空 📉') + '\n' +
-        '進場: ' + fmt(p.entryPrice) + '\n' +
-        '止損: ' + (p.sl > 0 ? fmt(p.sl) : '未設定') + '\n' +
-        'TP1: ' + (p.tp1 > 0 ? fmt(p.tp1) : '未設定') + ' ' + (p.tp1Done ? '✅' : '⏳') + '\n' +
-        'TP2: ' + (p.tp2 > 0 ? fmt(p.tp2) : '未設定') + ' ' + (p.tp2Done ? '✅' : '⏳') + '\n' +
-        'TP3: ' + (p.tp3 > 0 ? fmt(p.tp3) : '未設定') + ' ⏳\n' +
-        '持倉: ' + holdMin + '分鐘\n' +
-        '模式: ' + (p.flipMode ? '全倉' : '逐倉')
-      );
-    });
-    return;
-  }
-
-  if (text === '/log') {
-    var recent = memLog.slice(-15);
-    tg('📝 *最近日誌*\n' + recent.map(function(l) { return '[' + l.lv + '] ' + l.msg; }).join('\n'));
-    return;
-  }
-
-  if (text === '/sync') {
-    syncPositions().then(function() {
-      tg('✅ 持倉已同步\n目前: ' + Object.keys(positions).length + '個');
-    });
-    return;
-  }
-
-  if (text === '/closeall') {
-    if (Object.keys(positions).length === 0) { tg('目前無持倉'); return; }
-    var syms = Object.keys(positions);
-    var doClose = function(i) {
-      if (i >= syms.length) { tg('✅ 全部持倉已平'); return; }
-      var sym = syms[i];
-      var pos = positions[sym];
-      bxReq('GET', '/openApi/swap/v2/user/positions', { symbol: sym }).then(function(r2) {
-        if (r2.code === 0 && r2.data) {
-          var ap = r2.data.find(function(p) { return Math.abs(parseFloat(p.positionAmt || 0)) > 0; });
-          if (ap) {
-            var qty = Math.abs(parseFloat(ap.positionAmt));
-            return bxReq('POST', '/openApi/swap/v2/trade/order', {
-              symbol: sym, side: pos.side === 'LONG' ? 'SELL' : 'BUY',
-              positionSide: pos.side, type: 'MARKET', quantity: String(qty)
-            }).then(function() { return onPositionClosed(sym, pos, '手動全平'); });
-          }
-        }
-      }).catch(function(e) { log('ERROR', '平倉失敗 ' + sym + ': ' + e.message); })
-        .then(function() { doClose(i + 1); });
-    };
-    doClose(0);
-    return;
-  }
-
-  if (text === '/stats') {
-    var top = Object.entries(stats.symbolPerf)
-      .filter(function(e) { return e[1].total >= 3; })
-      .sort(function(a, b) { return b[1].pnl - a[1].pnl; })
-      .slice(0, 5)
-      .map(function(e) { return '  ' + e[0] + ': ' + e[1].wins + '/' + e[1].total + ' ' + (e[1].pnl >= 0 ? '+' : '') + e[1].pnl.toFixed(2) + 'U'; })
-      .join('\n');
-    var worst = Object.entries(stats.symbolPerf)
-      .filter(function(e) { return e[1].total >= 3; })
-      .sort(function(a, b) { return a[1].pnl - b[1].pnl; })
-      .slice(0, 3)
-      .map(function(e) { return '  ' + e[0] + ': ' + e[1].wins + '/' + e[1].total + ' ' + e[1].pnl.toFixed(2) + 'U'; })
-      .join('\n');
-    tg(
-      '🧠 *AI學習統計*\n' +
-      '━━━━━━━━━━━━━━━━\n' +
-      '總交易: ' + stats.total + ' | 勝率: ' + (winRate()*100).toFixed(1) + '%\n' +
-      '━━━━━━━━━━━━━━━━\n' +
-      '🏆 最佳:\n' + (top || '  資料不足') + '\n' +
-      '━━━━━━━━━━━━━━━━\n' +
-      '⚠️ 最差:\n' + (worst || '  資料不足')
-    );
-    return;
-  }
-
-  if (text.startsWith('/')) {
-    tg('未知指令，輸入 /help 查看');
-  }
+function saveState() {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// ══════════════════════════════════
+let state = loadState();
+
+// ══════════════════════════════════════════════════
 // BingX API
-// ══════════════════════════════════
+// ══════════════════════════════════════════════════
 function bxReq(method, path, params) {
   params = params || {};
-  return new Promise(function(resolve, reject) {
-    var p = Object.assign({}, params, { timestamp: Date.now() });
-    var qs = Object.keys(p).filter(function(k) { return p[k] != null && p[k] !== ''; }).map(function(k) { return k + '=' + p[k]; }).join('&');
-    var sig = crypto.createHmac('sha256', BX_SECRET).update(qs).digest('hex');
-    var q = qs + '&signature=' + sig;
-    var opt = {
+  return new Promise((resolve, reject) => {
+    const p = { ...params, timestamp: Date.now() };
+    const qs = Object.keys(p).sort()
+      .filter(k => p[k] != null && p[k] !== '')
+      .map(k => `${k}=${p[k]}`).join('&');
+    const sig = crypto.createHmac('sha256', BX_SECRET).update(qs).digest('hex');
+    const fullQs = qs + '&signature=' + sig;
+    const opt = {
       hostname: 'open-api.bingx.com',
-      path: path + '?' + q,
-      method: method,
+      path: path + '?' + fullQs,
+      method,
       headers: { 'X-BX-APIKEY': BX_KEY, 'Content-Type': 'application/x-www-form-urlencoded' }
     };
-    var req = https.request(opt, function(rsp) {
-      var d = '';
-      rsp.on('data', function(c) { d += c; });
-      rsp.on('end', function() { try { resolve(JSON.parse(d)); } catch(e) { reject(new Error(d.slice(0,100))); } });
+    const req = https.request(opt, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(new Error(d.slice(0, 80))); } });
     });
-    req.on('error', function(e) { setTimeout(function() { reject(e); }, 1000); });
-    req.setTimeout(12000, function() { req.destroy(); reject(new Error('Timeout')); });
+    req.on('error', e => setTimeout(() => reject(e), 1000));
+    req.setTimeout(12000, () => { req.destroy(); reject(new Error('Timeout')); });
     req.end();
   });
 }
 
 function bxPublic(path, params) {
-  return new Promise(function(resolve, reject) {
-    var qs = params ? Object.keys(params).map(function(k) { return k + '=' + params[k]; }).join('&') : '';
-    var fullPath = qs ? path + '?' + qs : path;
-    var req = https.request({ hostname: 'open-api.bingx.com', path: fullPath, method: 'GET' }, function(rsp) {
-      var d = '';
-      rsp.on('data', function(c) { d += c; });
-      rsp.on('end', function() { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+  return new Promise((resolve, reject) => {
+    const qs = params ? Object.keys(params).map(k => `${k}=${params[k]}`).join('&') : '';
+    const fullPath = qs ? `${path}?${qs}` : path;
+    const req = https.request({ hostname: 'open-api.bingx.com', path: fullPath, method: 'GET' }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
     });
     req.on('error', reject);
-    req.setTimeout(10000, function() { req.destroy(); reject(new Error('Timeout')); });
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
     req.end();
   });
 }
 
-// ══════════════════════════════════
-// 取得前N交易量幣種
-// ══════════════════════════════════
-async function getTopSymbols() {
-  try {
-    var r = await bxPublic('/openApi/swap/v2/quote/ticker');
-    if (r.code !== 0 || !Array.isArray(r.data)) return [];
-    return r.data
-      .filter(function(t) { return t.symbol && t.symbol.endsWith('-USDT'); })
-      .sort(function(a, b) { return parseFloat(b.quoteVolume || 0) - parseFloat(a.quoteVolume || 0); })
-      .slice(0, TOP_N_SYMBOLS)
-      .map(function(t) { return t.symbol; });
-  } catch(e) { log('ERROR', '取得幣種失敗: ' + e.message); return []; }
+// ══════════════════════════════════════════════════
+// Telegram API
+// ══════════════════════════════════════════════════
+function tgReq(payload) {
+  return new Promise(resolve => {
+    const body = JSON.stringify(payload);
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${BOT_TOKEN}/${payload.method}`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(JSON.parse(d))); });
+    req.on('error', () => resolve({}));
+    req.write(body); req.end();
+  });
 }
 
-async function getKlines(symbol, tf, limit) {
-  limit = limit || 210;
+function tgSend(chatId, text, extra) {
+  return tgReq({ method: 'sendMessage', chat_id: chatId, text, parse_mode: 'HTML', ...extra });
+}
+
+function tgEdit(chatId, msgId, text, extra) {
+  return tgReq({ method: 'editMessageText', chat_id: chatId, message_id: msgId, text, parse_mode: 'HTML', ...extra });
+}
+
+function tgAnswer(cbId, text) {
+  return tgReq({ method: 'answerCallbackQuery', callback_query_id: cbId, text: text || '' });
+}
+
+function notify(msg) {
+  return tgSend(CHAT_ID, msg);
+}
+
+// ══════════════════════════════════════════════════
+// 技術指標
+// ══════════════════════════════════════════════════
+const I = {
+  ema(arr, n) {
+    if (arr.length < n) return null;
+    const k = 2 / (n + 1);
+    let e = arr.slice(0, n).reduce((s, v) => s + v, 0) / n;
+    for (let i = n; i < arr.length; i++) e = arr[i] * k + e * (1 - k);
+    return e;
+  },
+  rsi(arr, n) {
+    if (arr.length < n + 1) return null;
+    let g = 0, l = 0;
+    for (let i = arr.length - n; i < arr.length; i++) {
+      const d = arr[i] - arr[i - 1];
+      d > 0 ? g += d : l -= d;
+    }
+    return 100 - 100 / (1 + (g / n) / ((l / n) || 0.001));
+  },
+  atr(H, L, C, n) {
+    if (!H || !L || !C || C.length < n + 1) return null;
+    let t = [];
+    for (let i = C.length - n; i < C.length; i++)
+      t.push(Math.max(H[i] - L[i], Math.abs(H[i] - C[i-1]), Math.abs(L[i] - C[i-1])));
+    return t.reduce((s, v) => s + v, 0) / n;
+  },
+  macd(arr) {
+    const fast = I.ema(arr, 12);
+    const slow = I.ema(arr, 26);
+    const pFast = I.ema(arr.slice(0, -1), 12);
+    const pSlow = I.ema(arr.slice(0, -1), 26);
+    if (!fast || !slow || !pFast || !pSlow) return null;
+    return { macd: fast - slow, prev: pFast - pSlow };
+  }
+};
+
+// ══════════════════════════════════════════════════
+// 策略分析（三重確認）
+// ══════════════════════════════════════════════════
+// 1. Hades EMA 排列（主信號）
+function analyzeHades(closes, highs, lows) {
+  const result = { signal: 'NONE', score: 0, detail: '', strength: 0 };
+  if (closes.length < 200) return result;
+
+  const e9   = I.ema(closes, 9);
+  const e20  = I.ema(closes, 20);
+  const e50  = I.ema(closes, 50);
+  const e200 = I.ema(closes, 200);
+  const rsi  = I.rsi(closes, 14) || 50;
+  const cur  = closes[closes.length - 1];
+
+  if (!e9 || !e20 || !e50 || !e200) return result;
+
+  const nearE50 = Math.abs(cur - e50) / e50 < 0.012;
+
+  // 多頭排列：e9 > e20 > e50 > e200，價格在 e9 之上
+  if (e9 > e20 && e20 > e50 && e50 > e200 && cur > e9 && rsi > 45 && rsi < 80) {
+    result.signal = 'BUY';
+    result.score = 3;
+    // 靠近e50 = 更好的入場點
+    if (nearE50) result.score += 1;
+    result.detail = `多頭排列 EMA9>${e9.toFixed(2)} EMA20>${e20.toFixed(2)} EMA50>${e50.toFixed(2)} EMA200>${e200.toFixed(2)}`;
+  }
+
+  // 空頭排列：e9 < e20 < e50 < e200，價格在 e9 之下
+  if (e9 < e20 && e20 < e50 && e50 < e200 && cur < e9 && rsi > 20 && rsi < 55) {
+    result.signal = 'SELL';
+    result.score = -3;
+    if (nearE50) result.score -= 1;
+    result.detail = `空頭排列 EMA9<${e9.toFixed(2)} EMA20<${e20.toFixed(2)} EMA50<${e50.toFixed(2)} EMA200<${e200.toFixed(2)}`;
+  }
+
+  result.strength = Math.abs(result.score);
+  return result;
+}
+
+// 2. 賽克斯 Wyckoff 結構確認
+function analyzeWyckoff(closes, highs, lows, vols) {
+  const result = { confirm: false, score: 0, detail: '' };
+  if (closes.length < 30) return result;
+
+  const last = closes.length - 1;
+  const cur = closes[last];
+  const prev = closes[last - 1];
+  const support = Math.min(...lows.slice(-30, -1));
+  const resistance = Math.max(...highs.slice(-30, -1));
+  const avgVol = vols.slice(-20, -1).reduce((s, v) => s + v, 0) / 19;
+  const volSpike = vols[last] > avgVol * 1.2;
+  const rsi = I.rsi(closes, 14) || 50;
+
+  // 強勢突破（SOS）= 多頭確認
+  if (cur > resistance && prev <= resistance && volSpike && rsi > 52) {
+    result.score += 2; result.detail = 'Wyckoff SOS突破阻力';
+  }
+  // 彈簧（Spring）= 多頭確認
+  if (lows[last-1] < support * 1.001 && cur > support && cur > prev && volSpike && rsi < 50) {
+    result.score += 2; result.detail = 'Wyckoff Spring彈簧';
+  }
+  // 弱勢跌破（SOW）= 空頭確認
+  if (cur < support && prev >= support && volSpike && rsi < 48) {
+    result.score -= 2; result.detail = 'Wyckoff SOW跌破支撐';
+  }
+  // 推力（Upthrust）= 空頭確認
+  if (highs[last-1] > resistance * 0.999 && cur < resistance && cur < prev && volSpike && rsi > 50) {
+    result.score -= 2; result.detail = 'Wyckoff Upthrust推力';
+  }
+
+  result.confirm = result.score !== 0;
+  return result;
+}
+
+// 3. MACD 突破確認
+function analyzeBreakout(closes, highs, lows) {
+  const result = { confirm: false, score: 0, detail: '' };
+  if (closes.length < 50) return result;
+
+  const m = I.macd(closes);
+  const e20 = I.ema(closes, 20);
+  const e60 = I.ema(closes, 60);
+  const rsi = I.rsi(closes, 14) || 50;
+
+  if (!m || !e20 || !e60) return result;
+
+  // MACD 金叉 = 多頭
+  if (m.prev < 0 && m.macd > 0 && e20 > e60 && rsi > 45 && rsi < 75) {
+    result.score += 1; result.detail = 'MACD金叉';
+  }
+  // MACD 死叉 = 空頭
+  if (m.prev > 0 && m.macd < 0 && e20 < e60 && rsi < 55 && rsi > 25) {
+    result.score -= 1; result.detail = 'MACD死叉';
+  }
+  // MACD 持續多頭
+  if (m.macd > 0 && m.macd > m.prev && e20 > e60) {
+    result.score += 0.5; result.detail += ' +動能';
+  }
+  // MACD 持續空頭
+  if (m.macd < 0 && m.macd < m.prev && e20 < e60) {
+    result.score -= 0.5; result.detail += ' +動能';
+  }
+
+  result.confirm = result.score !== 0;
+  return result;
+}
+
+// 三重確認整合
+function tripleConfirm(closes, highs, lows, vols) {
+  const hades    = analyzeHades(closes, highs, lows);
+  const wyckoff  = analyzeWyckoff(closes, highs, lows, vols);
+  const breakout = analyzeBreakout(closes, highs, lows);
+
+  if (hades.signal === 'NONE') return { signal: 'NONE', score: 0, reasons: [] };
+
+  const dir = hades.signal === 'BUY' ? 1 : -1;
+
+  // 賽克斯方向一致 且 突破確認方向一致 才通過
+  const wyckoffOk  = wyckoff.score * dir > 0;
+  const breakoutOk = breakout.score * dir > 0;
+
+  if (!wyckoffOk && !breakoutOk) return { signal: 'NONE', score: 0, reasons: ['三重確認未通過'] };
+
+  const totalScore = hades.score + wyckoff.score + breakout.score;
+  const reasons = [hades.detail, wyckoff.detail, breakout.detail].filter(Boolean);
+
+  return {
+    signal: hades.signal,
+    score: totalScore,
+    hadesScore: hades.score,
+    wyckoffScore: wyckoff.score,
+    breakoutScore: breakout.score,
+    strength: Math.abs(totalScore),
+    reasons,
+    wyckoffOk,
+    breakoutOk
+  };
+}
+
+// ══════════════════════════════════════════════════
+// 取市值前200幣種（獵人掃描）
+// ══════════════════════════════════════════════════
+const BLACKLIST = ['NCSK', 'NCSI', 'NCCO', 'BABYSHARK', 'HOOLI', 'BROCCOLIF3B', '1000000BOB', 'SWARMS', 'KOMA', 'PRL'];
+
+async function getTop200Symbols() {
   try {
-    var r = await bxReq('GET', '/openApi/swap/v2/quote/klines', { symbol: symbol, interval: tf, limit: limit });
+    const r = await bxPublic('/openApi/swap/v2/quote/contracts');
+    if (r.code === 0 && r.data) {
+      const syms = r.data.filter(s => {
+        if (!s.symbol || !s.symbol.endsWith('-USDT')) return false;
+        const name = s.symbol.replace('-USDT', '');
+        return !BLACKLIST.some(b => name.startsWith(b));
+      });
+      syms.sort((a, b) => parseFloat(b.volume || 0) - parseFloat(a.volume || 0));
+      return syms.slice(0, 200).map(s => s.symbol);
+    }
+  } catch(e) { log('WARN', '取幣種失敗: ' + e.message); }
+  return ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'XRP-USDT', 'DOGE-USDT',
+          'ADA-USDT', 'SUI-USDT', 'HYPE-USDT', 'WIF-USDT', 'RUNE-USDT'];
+}
+
+// ══════════════════════════════════════════════════
+// 交易所操作
+// ══════════════════════════════════════════════════
+async function getPrice(sym) {
+  const r = await bxPublic('/openApi/swap/v2/quote/ticker', { symbol: sym });
+  return parseFloat(r?.data?.lastPrice || 0);
+}
+
+async function getBalance() {
+  const r = await bxReq('GET', '/openApi/swap/v2/user/balance', {});
+  if (r.code === 0) return parseFloat(r.data.balance.availableMargin || 0);
+  return 0;
+}
+
+async function getKlines(sym, tf, limit) {
+  try {
+    const r = await bxReq('GET', '/openApi/swap/v2/quote/klines', { symbol: sym, interval: tf || '1h', limit: limit || 210 });
     if (r.code === 0 && Array.isArray(r.data)) return r.data;
   } catch(e) {}
   return [];
 }
 
-// ══════════════════════════════════
-// 技術指標
-// ══════════════════════════════════
-function calcEMA(closes, period) {
-  if (closes.length < period) return null;
-  var k = 2 / (period + 1);
-  var ema = closes.slice(0, period).reduce(function(s, v) { return s + v; }, 0) / period;
-  for (var i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
-  return ema;
-}
-
-function calcATR(highs, lows, closes, n) {
-  n = n || 14;
-  if (highs.length < n + 1) return null;
-  var trs = [];
-  for (var i = 1; i < highs.length; i++) trs.push(Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i-1]), Math.abs(lows[i] - closes[i-1])));
-  if (trs.length < n) return null;
-  return trs.slice(-n).reduce(function(s, v) { return s + v; }, 0) / n;
-}
-
-// ══════════════════════════════════
-// 賽克斯（Wyckoff + 量能）
-// ══════════════════════════════════
-function calcSykes(klines) {
-  if (klines.length < 50) return null;
-  var closes = klines.map(function(k) { return parseFloat(k[4]); });
-  var highs   = klines.map(function(k) { return parseFloat(k[2]); });
-  var lows    = klines.map(function(k) { return parseFloat(k[3]); });
-  var vols    = klines.map(function(k) { return parseFloat(k[5]); });
-  var opens   = klines.map(function(k) { return parseFloat(k[1]); });
-  var last    = closes.length - 1;
-  var volMA   = vols.slice(-20).reduce(function(s,v){return s+v;},0) / 20;
-  var curVol  = vols[last];
-  var volRatio= curVol / volMA;
-  var isUp    = closes[last] > opens[last];
-  var volScore= isUp ? volRatio : -volRatio;
-  var lb      = Math.min(50, closes.length);
-  var sHigh   = Math.max.apply(null, highs.slice(-lb));
-  var sLow    = Math.min.apply(null, lows.slice(-lb));
-  var range   = sHigh - sLow;
-  if (range === 0) return null;
-  var posInRange = (closes[last] - sLow) / range;
-  var nearBottom = posInRange < 0.3;
-  var nearTop    = posInRange > 0.7;
-  var prevLow5   = Math.min.apply(null, lows.slice(-6, -1));
-  var prevHigh5  = Math.max.apply(null, highs.slice(-6, -1));
-  var springTest = lows[last] <= prevLow5 * 1.002;
-  var utadTest   = highs[last] >= prevHigh5 * 0.998;
-  var rebound    = closes[last] > opens[last];
-  var rejection  = closes[last] < opens[last];
-  var volExp     = curVol > volMA * 1.2;
-  var wyckoff    = 0;
-  if (nearBottom && springTest && rebound && volExp)   wyckoff =  1;
-  else if (nearTop && utadTest && rejection && volExp) wyckoff = -1;
-  var sykesValue = volScore * (1 + Math.abs(wyckoff));
-  return { value: sykesValue, wyckoff: wyckoff, volRatio: volRatio, posInRange: posInRange, longSignal: wyckoff === 1 && sykesValue > 0, shortSignal: wyckoff === -1 && sykesValue < 0 };
-}
-
-// ══════════════════════════════════
-// 突破條件（EMA + 結構 + 等K線收盤）
-// ══════════════════════════════════
-function calcBreakout(klines) {
-  if (klines.length < 210) return null;
-  var closes = klines.map(function(k) { return parseFloat(k[4]); });
-  var highs   = klines.map(function(k) { return parseFloat(k[2]); });
-  var lows    = klines.map(function(k) { return parseFloat(k[3]); });
-  var last    = closes.length - 1;
-  var ema9    = calcEMA(closes, 9);
-  var ema20   = calcEMA(closes, 20);
-  var ema50   = calcEMA(closes, 50);
-  var ema200  = calcEMA(closes, 200);
-  if (!ema9 || !ema20 || !ema50 || !ema200) return null;
-  var curClose  = closes[last];
-  var prevClose = closes[last - 1];
-  var bullAlign = ema9 > ema20 && ema20 > ema50 && ema50 > ema200 && curClose > ema9;
-  var bearAlign = ema9 < ema20 && ema20 < ema50 && ema50 < ema200 && curClose < ema9;
-  var structHigh = Math.max.apply(null, highs.slice(-22, -2));
-  var structLow  = Math.min.apply(null, lows.slice(-22, -2));
-  var bullBreak  = prevClose > structHigh && bullAlign;
-  var bearBreak  = prevClose < structLow  && bearAlign;
-  var atr = calcATR(highs, lows, closes, 14);
-  return { ema9: ema9, ema20: ema20, ema50: ema50, ema200: ema200, bullAlign: bullAlign, bearAlign: bearAlign, bullBreak: bullBreak, bearBreak: bearBreak, structHigh: structHigh, structLow: structLow, atr: atr, curClose: curClose, prevClose: prevClose };
-}
-
-function checkSignal(sykes, breakout) {
-  if (!sykes || !breakout) return null;
-  if (sykes.longSignal  && breakout.bullBreak) return 'LONG';
-  if (sykes.shortSignal && breakout.bearBreak) return 'SHORT';
-  return null;
-}
-
-// ══════════════════════════════════
-// 止盈止損計算
-// ══════════════════════════════════
-function calcLevels(side, entryPrice, atr, flipMode) {
-  var slPct  = flipMode ? MAX_LOSS_MARGIN : MAX_LOSS_PCT;
-  var slDist = entryPrice * slPct;
-  var atrDist= atr ? atr * 1.5 : slDist;
-  var useDist= flipMode ? Math.max(slDist, atrDist * 3) : Math.max(slDist, atrDist);
-  var sl, tp1, tp2, tp3;
-  if (side === 'LONG') { sl = entryPrice - useDist; tp1 = entryPrice + useDist * TP1_RR; tp2 = entryPrice + useDist * TP2_RR; tp3 = entryPrice + useDist * TP3_RR; }
-  else                 { sl = entryPrice + useDist; tp1 = entryPrice - useDist * TP1_RR; tp2 = entryPrice - useDist * TP2_RR; tp3 = entryPrice - useDist * TP3_RR; }
-  return { sl: sl, tp1: tp1, tp2: tp2, tp3: tp3, dist: useDist };
-}
-
-// ══════════════════════════════════
-// 槓桿設定
-// ══════════════════════════════════
-async function setLeverage(symbol, lev, flipMode) {
-  var marginType = flipMode ? 'CROSSED' : 'ISOLATED';
-  try { await bxReq('POST', '/openApi/swap/v2/trade/marginType', { symbol: symbol, marginType: marginType }); } catch(e) {}
-  for (var i = 0; i < 2; i++) {
-    try { await bxReq('POST', '/openApi/swap/v2/trade/leverage', { symbol: symbol, side: i === 0 ? 'LONG' : 'SHORT', leverage: lev }); } catch(e) {}
+async function setLeverage(sym, lev) {
+  for (const side of ['LONG', 'SHORT']) {
+    try { await bxReq('POST', '/openApi/swap/v2/trade/leverage', { symbol: sym, side, leverage: lev }); } catch(e) {}
   }
 }
 
-// ══════════════════════════════════
-// 開倉
-// ══════════════════════════════════
-async function placeOrder(symbol, side, sl, tp1, flipMode) {
-  await setLeverage(symbol, LEVERAGE, flipMode);
-  var orderSide = side === 'LONG' ? 'BUY' : 'SELL';
-  var closeSide = side === 'LONG' ? 'SELL' : 'BUY';
-  var r = await bxReq('POST', '/openApi/swap/v2/trade/order', { symbol: symbol, side: orderSide, positionSide: side, type: 'MARKET', quoteOrderQty: String(ORDER_AMT * LEVERAGE) });
-  if (r.code !== 0) throw new Error('開倉失敗: ' + r.msg);
-  await new Promise(function(res) { setTimeout(res, 1500); });
-  var entryPrice = parseFloat(r.data && r.data.order && r.data.order.avgPrice || 0);
-  var qty        = parseFloat(r.data && r.data.order && r.data.order.executedQty || 0);
-  var orderId    = r.data && r.data.order && r.data.order.orderId;
-  if (qty <= 0) throw new Error('開倉數量為0');
-  await bxReq('POST', '/openApi/swap/v2/trade/order', { symbol: symbol, side: closeSide, positionSide: side, type: 'STOP_MARKET', stopPrice: String(sl.toFixed(6)), quantity: String(qty), workingType: 'MARK_PRICE' }).catch(function(e) { log('WARN', 'SL失敗: ' + e.message); });
-  var tp1Qty = parseFloat((qty * TP_RATIO).toFixed(6));
-  await bxReq('POST', '/openApi/swap/v2/trade/order', { symbol: symbol, side: closeSide, positionSide: side, type: 'TAKE_PROFIT_MARKET', stopPrice: String(tp1.toFixed(6)), quantity: String(tp1Qty), workingType: 'MARK_PRICE' }).catch(function(e) { log('WARN', 'TP1失敗: ' + e.message); });
-  return { orderId: orderId, entryPrice: entryPrice, qty: qty };
+async function placeOrder(sym, side, posSide, qty, sl, tp, lev) {
+  await setLeverage(sym, lev);
+  const r = await bxReq('POST', '/openApi/swap/v2/trade/order', {
+    symbol: sym, side, positionSide: posSide, type: 'MARKET', quantity: String(qty)
+  });
+  if (r.code !== 0) throw new Error('開單失敗: ' + r.msg);
+  await new Promise(res => setTimeout(res, 1000));
+  const execQty   = parseFloat(r.data.order.executedQty || qty);
+  const execPrice = parseFloat(r.data.order.avgPrice || 0);
+  const closeSide = posSide === 'LONG' ? 'SELL' : 'BUY';
+  if (sl && execQty > 0)
+    await bxReq('POST', '/openApi/swap/v2/trade/order', {
+      symbol: sym, side: closeSide, positionSide: posSide,
+      type: 'STOP_MARKET', stopPrice: String(sl), quantity: String(execQty), workingType: 'MARK_PRICE'
+    }).catch(() => {});
+  if (tp && execQty > 0)
+    await bxReq('POST', '/openApi/swap/v2/trade/order', {
+      symbol: sym, side: closeSide, positionSide: posSide,
+      type: 'TAKE_PROFIT_MARKET', stopPrice: String(tp), quantity: String(execQty), workingType: 'MARK_PRICE'
+    }).catch(() => {});
+  return { qty: execQty, price: execPrice };
 }
 
-// ══════════════════════════════════
-// 同步持倉（重啟恢復）
-// ══════════════════════════════════
+async function cancelAllOrders(sym, ps) {
+  try {
+    const r = await bxReq('GET', '/openApi/swap/v2/trade/openOrders', { symbol: sym });
+    if (r.code === 0 && r.data?.orders) {
+      for (const o of r.data.orders.filter(o => o.positionSide === ps)) {
+        await bxReq('POST', '/openApi/swap/v2/trade/cancel', { symbol: sym, orderId: o.orderId }).catch(() => {});
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+  } catch(e) {}
+}
+
+async function getPositions(sym) {
+  try {
+    const r = await bxReq('GET', '/openApi/swap/v2/user/positions', sym ? { symbol: sym } : {});
+    if (r.code === 0) return (r.data || []).filter(p => parseFloat(p.positionAmt || 0) !== 0);
+  } catch(e) {}
+  return [];
+}
+
+async function getRealPnl(sym, openTime) {
+  try {
+    const r = await bxReq('GET', '/openApi/swap/v2/user/income', { limit: 50, startTime: String(openTime - 3600000) });
+    if (r.code === 0 && r.data?.length > 0) {
+      const items = r.data.filter(o =>
+        o.symbol === sym && parseInt(o.time || 0) > openTime &&
+        (o.incomeType === 'REALIZED_PNL' || o.incomeType === 'TRADING_FEE')
+      );
+      if (items.length > 0) return items.reduce((s, o) => s + parseFloat(o.income || 0), 0);
+    }
+  } catch(e) {}
+  return null;
+}
+
+// ══════════════════════════════════════════════════
+// 統計記錄
+// ══════════════════════════════════════════════════
+function recordTrade(sym, side, pnl, holdMin) {
+  const today = todayKey();
+  if (!state.stats.daily[today])
+    state.stats.daily[today] = { total: 0, wins: 0, losses: 0, pnl: 0 };
+  const d = state.stats.daily[today];
+  d.total++; pnl > 0 ? d.wins++ : d.losses++; d.pnl = round(d.pnl + pnl, 4);
+  state.stats.allTime.total++;
+  pnl > 0 ? state.stats.allTime.wins++ : state.stats.allTime.losses++;
+  state.stats.allTime.pnl = round(state.stats.allTime.pnl + pnl, 4);
+  state.capital = round(state.capital + pnl, 4);
+  state.stats.trades.push({ symbol: sym, side, pnl, holdMin, date: today, time: Date.now() });
+  if (state.stats.trades.length > 500) state.stats.trades = state.stats.trades.slice(-500);
+  saveState();
+}
+
+// ══════════════════════════════════════════════════
+// 開單通知（詳細版）
+// ══════════════════════════════════════════════════
+function buildOpenMsg(sym, sig, entry, sl, tp1, tp2, tp3, qty, lev) {
+  const dir   = sig.signal === 'BUY';
+  const emoji = dir ? '🟢' : '🔴';
+  const dirTxt = dir ? '多單 LONG' : '空單 SHORT';
+  const slDist = Math.abs(entry - sl);
+  const slPct  = (slDist / entry * 100).toFixed(2);
+  const tp1Pct = (Math.abs(entry - tp1) / entry * 100).toFixed(2);
+  const notional = round(qty * entry, 2);
+
+  // 強度視覺化
+  const bars = '█'.repeat(Math.min(sig.strength, 5)) + '░'.repeat(Math.max(0, 5 - sig.strength));
+  const hadesBar  = Math.abs(sig.hadesScore || 0);
+  const wyckBar   = Math.abs(sig.wyckoffScore || 0);
+  const brkBar    = Math.abs(sig.breakoutScore || 0);
+
+  let msg = `╔═══════════════════════╗\n`;
+  msg += `║  ${emoji} HADES 開倉通知  ${emoji}  ║\n`;
+  msg += `╚═══════════════════════╝\n\n`;
+  msg += `<b>幣種：</b>${sym}\n`;
+  msg += `<b>方向：</b>${emoji} ${dirTxt}\n`;
+  msg += `<b>槓桿：</b>${lev}x　<b>數量：</b>${qty}（名目 ${notional}U）\n\n`;
+  msg += `━━━ 價位 ━━━\n`;
+  msg += `📍 入場：<b>${entry}</b>\n`;
+  msg += `🛑 止損：<code>${sl}</code>（-${slPct}%）\n`;
+  msg += `🎯 TP1：<code>${tp1}</code>（+${tp1Pct}% | RR 1:1）\n`;
+  if (tp2) msg += `🎯 TP2：<code>${tp2}</code>（+${(Math.abs(entry-tp2)/entry*100).toFixed(2)}% | RR 1:2）\n`;
+  if (tp3) msg += `🎯 TP3：<code>${tp3}</code>（+${(Math.abs(entry-tp3)/entry*100).toFixed(2)}% | RR 1:3）\n`;
+  msg += `\n━━━ 三重確認分析 ━━━\n`;
+  msg += `🗡️ Hades EMA：  ${bars} ${sig.hadesScore >= 0 ? '+' : ''}${sig.hadesScore || 0}\n`;
+  msg += `🏛️ Wyckoff結構：${bars} ${sig.wyckoffScore >= 0 ? '+' : ''}${sig.wyckoffScore || 0}\n`;
+  msg += `⚡ MACD突破：   ${bars} ${sig.breakoutScore >= 0 ? '+' : ''}${sig.breakoutScore || 0}\n`;
+  msg += `📊 總分：<b>${sig.score >= 0 ? '+' : ''}${sig.score}</b>　強度：[${bars}]\n\n`;
+  msg += `━━━ 信號依據 ━━━\n`;
+  sig.reasons.forEach(r => msg += `• ${r}\n`);
+  msg += `\n⏰ ${ts()}`;
+  return msg;
+}
+
+function buildCloseMsg(t, pnl, holdMin, cur) {
+  const win   = pnl >= 0;
+  const emoji = win ? '✅' : '❌';
+  const pnlStr = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + 'U';
+  const pctStr = (pnl >= 0 ? '+' : '') + ((pnl / state.amount) * 100).toFixed(1) + '%';
+  const today  = todayKey();
+  const d      = state.stats.daily[today] || { pnl: 0, total: 0, wins: 0 };
+
+  let msg = `${emoji} <b>HADES 平倉</b>\n\n`;
+  msg += `<b>幣種：</b>${t.symbol}　${t.side === 'LONG' ? '🟢多' : '🔴空'}\n`;
+  msg += `<b>入場：</b>${t.entry}　<b>出場：</b>${cur || '—'}\n`;
+  msg += `<b>持倉：</b>${holdMin} 分鐘\n\n`;
+  msg += `💰 本次PnL：<b>${pnlStr}</b>（${pctStr}）\n\n`;
+  msg += `━━━ 今日戰績 ━━━\n`;
+  msg += `筆數：${d.total}　WR：${d.total > 0 ? (d.wins / d.total * 100).toFixed(0) : 0}%\n`;
+  msg += `今日PnL：${d.pnl >= 0 ? '+' : ''}${(d.pnl).toFixed(4)}U\n`;
+  msg += `本金：${state.capital.toFixed(2)}U\n`;
+  msg += `\n⏰ ${ts()}`;
+  return msg;
+}
+
+// ══════════════════════════════════════════════════
+// Telegram 選單（Inline Keyboard）
+// ══════════════════════════════════════════════════
+const MENUS = {
+  main: {
+    text: () => {
+      const at  = state.stats.allTime;
+      const wr  = at.total > 0 ? (at.wins / at.total * 100).toFixed(1) : '0.0';
+      const today = todayKey();
+      const d   = state.stats.daily[today] || { total: 0, wins: 0, pnl: 0 };
+      const dwr = d.total > 0 ? (d.wins / d.total * 100).toFixed(0) : '0';
+      const openCount = Object.keys(state.openTrades).length;
+      const statusIcon = state.running ? '🟢 運行中' : '🔴 已停止';
+
+      return `🗡️ <b>HADES 三重確認機器人</b>\n` +
+        `━━━━━━━━━━━━━━━━━\n` +
+        `狀態：${statusIcon}\n` +
+        `本金：<b>${state.capital.toFixed(2)}U</b>　槓桿：${state.leverage}x\n` +
+        `持倉：${openCount}/${state.maxPositions}　幣種：${state.symbols.length}\n` +
+        `━━━━━━━━━━━━━━━━━\n` +
+        `今日 ${d.total}筆  WR ${dwr}%  PnL ${d.pnl >= 0 ? '+' : ''}${d.pnl.toFixed(4)}U\n` +
+        `累計 ${at.total}筆  WR ${wr}%  PnL ${at.pnl >= 0 ? '+' : ''}${at.pnl.toFixed(4)}U\n` +
+        `━━━━━━━━━━━━━━━━━\n` +
+        `<i>選擇功能：</i>`;
+    },
+    keyboard: () => ({
+      inline_keyboard: [
+        [
+          { text: state.running ? '⏹ 停止交易' : '▶️ 啟動交易', callback_data: 'toggle_run' },
+          { text: '🔄 同步持倉', callback_data: 'sync' }
+        ],
+        [
+          { text: '📊 持倉狀態', callback_data: 'positions' },
+          { text: '📈 今日戰績', callback_data: 'today_stats' }
+        ],
+        [
+          { text: '🔍 掃描市場', callback_data: 'scan' },
+          { text: '⚙️ 設定', callback_data: 'settings' }
+        ],
+        [
+          { text: '📜 近期交易', callback_data: 'recent_trades' },
+          { text: '🏆 最佳幣種', callback_data: 'best_symbols' }
+        ],
+        [
+          { text: '❓ 策略說明', callback_data: 'strategy_info' }
+        ]
+      ]
+    })
+  }
+};
+
+async function showMenu(chatId, msgId) {
+  const text = MENUS.main.text();
+  const replyMarkup = MENUS.main.keyboard();
+  if (msgId) {
+    await tgEdit(chatId, msgId, text, { reply_markup: replyMarkup });
+  } else {
+    await tgSend(chatId, text, { reply_markup: replyMarkup });
+  }
+}
+
+// ══════════════════════════════════════════════════
+// Callback 處理
+// ══════════════════════════════════════════════════
+async function handleCallback(cbq) {
+  const data   = cbq.data;
+  const chatId = cbq.message.chat.id;
+  const msgId  = cbq.message.message_id;
+
+  await tgAnswer(cbq.id);
+
+  if (data === 'main') { await showMenu(chatId, msgId); return; }
+
+  if (data === 'toggle_run') {
+    state.running = !state.running;
+    saveState();
+    await showMenu(chatId, msgId);
+    return;
+  }
+
+  if (data === 'sync') {
+    await tgEdit(chatId, msgId, '🔄 同步中...', {});
+    await syncPositions();
+    await showMenu(chatId, msgId);
+    return;
+  }
+
+  if (data === 'scan') {
+    await tgEdit(chatId, msgId, '🔍 掃描市值前200幣種...', {});
+    const syms = await getTop200Symbols();
+    state.symbols = syms;
+    saveState();
+    await tgEdit(chatId, msgId,
+      `✅ 掃描完成！\n載入 <b>${syms.length}</b> 個幣種\n` +
+      `前10名：${syms.slice(0,10).map(s=>s.replace('-USDT','')).join(', ')}\n\n` +
+      `⏰ ${ts()}`,
+      { reply_markup: { inline_keyboard: [[{ text: '← 返回', callback_data: 'main' }]] } }
+    );
+    return;
+  }
+
+  if (data === 'positions') {
+    const keys = Object.keys(state.openTrades);
+    if (keys.length === 0) {
+      await tgEdit(chatId, msgId,
+        `📊 <b>目前持倉</b>\n\n目前無持倉`,
+        { reply_markup: { inline_keyboard: [[{ text: '← 返回', callback_data: 'main' }]] } }
+      );
+      return;
+    }
+    let msg = `📊 <b>目前持倉</b>（${keys.length}/${state.maxPositions}）\n━━━━━━━━━━━━━━━━━\n`;
+    for (const k of keys) {
+      const t = state.openTrades[k];
+      if (!t) continue;
+      const holdMin = Math.round((Date.now() - t.openTime) / 60000);
+      let cur = 0;
+      try { cur = await getPrice(t.symbol); } catch(e) {}
+      const pctChg = cur ? (t.side === 'LONG' ? pct(cur, t.entry) : pct(t.entry, cur)) : '—';
+      const pnlEst = cur ? round((t.side === 'LONG' ? cur - t.entry : t.entry - cur) * t.qty, 4) : 0;
+      const dirIcon = t.side === 'LONG' ? '🟢' : '🔴';
+      msg += `${dirIcon} <b>${t.symbol}</b>（${t.side}）\n`;
+      msg += `   入場：${t.entry}　現價：${cur || '?'}\n`;
+      msg += `   損益：${pnlEst >= 0 ? '+' : ''}${pnlEst}U（${pctChg}%）　持倉：${holdMin}min\n`;
+      msg += `   SL：${t.stopLoss || '—'}　TP1：${t.takeProfit || '—'}\n`;
+      msg += `━━━━━━━━━━━━━━━━━\n`;
+    }
+    await tgEdit(chatId, msgId, msg, {
+      reply_markup: { inline_keyboard: [[{ text: '🔄 刷新', callback_data: 'positions' }, { text: '← 返回', callback_data: 'main' }]] }
+    });
+    return;
+  }
+
+  if (data === 'today_stats') {
+    const today = todayKey();
+    const d = state.stats.daily[today] || { total: 0, wins: 0, losses: 0, pnl: 0 };
+    const wr = d.total > 0 ? (d.wins / d.total * 100).toFixed(1) : '0.0';
+    const at = state.stats.allTime;
+    const awr = at.total > 0 ? (at.wins / at.total * 100).toFixed(1) : '0.0';
+    const msg =
+      `📈 <b>今日戰績</b>（${today}）\n` +
+      `━━━━━━━━━━━━━━━━━\n` +
+      `總筆數：${d.total}　勝：${d.wins}　敗：${d.losses}\n` +
+      `勝率：<b>${wr}%</b>\n` +
+      `今日PnL：<b>${d.pnl >= 0 ? '+' : ''}${d.pnl.toFixed(4)}U</b>\n` +
+      `━━━━━━━━━━━━━━━━━\n` +
+      `📊 累計統計\n` +
+      `總筆數：${at.total}　WR：<b>${awr}%</b>\n` +
+      `累計PnL：<b>${at.pnl >= 0 ? '+' : ''}${at.pnl.toFixed(4)}U</b>\n` +
+      `當前本金：<b>${state.capital.toFixed(2)}U</b>\n` +
+      `\n⏰ ${ts()}`;
+    await tgEdit(chatId, msgId, msg, {
+      reply_markup: { inline_keyboard: [[{ text: '← 返回', callback_data: 'main' }]] }
+    });
+    return;
+  }
+
+  if (data === 'recent_trades') {
+    const trades = state.stats.trades.slice(-10).reverse();
+    if (trades.length === 0) {
+      await tgEdit(chatId, msgId, `📜 尚無交易記錄`,
+        { reply_markup: { inline_keyboard: [[{ text: '← 返回', callback_data: 'main' }]] } });
+      return;
+    }
+    let msg = `📜 <b>近10筆交易</b>\n━━━━━━━━━━━━━━━━━\n`;
+    trades.forEach((t, i) => {
+      const icon = t.pnl >= 0 ? '✅' : '❌';
+      const dirIcon = t.side === 'LONG' ? '🟢' : '🔴';
+      msg += `${i + 1}. ${icon}${dirIcon} ${t.symbol.replace('-USDT', '')}\n`;
+      msg += `   PnL：${t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(4)}U　持倉：${t.holdMin}min\n`;
+    });
+    await tgEdit(chatId, msgId, msg, {
+      reply_markup: { inline_keyboard: [[{ text: '← 返回', callback_data: 'main' }]] }
+    });
+    return;
+  }
+
+  if (data === 'best_symbols') {
+    const trades = state.stats.trades;
+    const symMap = {};
+    trades.forEach(t => {
+      if (!symMap[t.symbol]) symMap[t.symbol] = { wins: 0, losses: 0, pnl: 0, total: 0 };
+      symMap[t.symbol].total++;
+      t.pnl > 0 ? symMap[t.symbol].wins++ : symMap[t.symbol].losses++;
+      symMap[t.symbol].pnl += t.pnl;
+    });
+    const sorted = Object.entries(symMap).sort((a, b) => b[1].pnl - a[1].pnl).slice(0, 8);
+    if (sorted.length === 0) {
+      await tgEdit(chatId, msgId, `🏆 尚無足夠數據`,
+        { reply_markup: { inline_keyboard: [[{ text: '← 返回', callback_data: 'main' }]] } });
+      return;
+    }
+    let msg = `🏆 <b>最佳幣種排名</b>\n━━━━━━━━━━━━━━━━━\n`;
+    sorted.forEach(([sym, s], i) => {
+      const wr = (s.wins / s.total * 100).toFixed(0);
+      const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i+1}.`;
+      msg += `${medal} ${sym.replace('-USDT', '')}\n`;
+      msg += `   WR：${wr}%  PnL：${s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(3)}U  (${s.total}筆)\n`;
+    });
+    await tgEdit(chatId, msgId, msg, {
+      reply_markup: { inline_keyboard: [[{ text: '← 返回', callback_data: 'main' }]] }
+    });
+    return;
+  }
+
+  if (data === 'settings') {
+    const msg =
+      `⚙️ <b>目前設定</b>\n` +
+      `━━━━━━━━━━━━━━━━━\n` +
+      `本金：${state.capital.toFixed(2)}U\n` +
+      `每單金額：${state.amount}U\n` +
+      `槓桿：${state.leverage}x\n` +
+      `最大持倉：${state.maxPositions}個\n` +
+      `同向上限：${state.maxSameDir}個\n` +
+      `允許做空：${state.allowShort ? '✅ 是' : '❌ 否'}\n` +
+      `每日虧損上限：${state.dailyLossPct}%\n` +
+      `━━━━━━━━━━━━━━━━━\n` +
+      `<i>修改設定請使用指令：</i>\n` +
+      `/set_amount 金額\n/set_lev 槓桿\n/set_short on|off`;
+    await tgEdit(chatId, msgId, msg, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: state.allowShort ? '🔴 關閉做空' : '🟢 開啟做空', callback_data: 'toggle_short' }
+          ],
+          [{ text: '← 返回', callback_data: 'main' }]
+        ]
+      }
+    });
+    return;
+  }
+
+  if (data === 'toggle_short') {
+    state.allowShort = !state.allowShort;
+    saveState();
+    await handleCallback({ ...cbq, data: 'settings' });
+    return;
+  }
+
+  if (data === 'strategy_info') {
+    const msg =
+      `🗡️ <b>HADES 三重確認策略</b>\n` +
+      `━━━━━━━━━━━━━━━━━\n\n` +
+      `<b>1️⃣ 獵人掃描（市場篩選）</b>\n` +
+      `• 掃描市值前200幣種\n` +
+      `• 過濾低流動性及問題幣\n\n` +
+      `<b>2️⃣ Hades EMA（主信號）</b>\n` +
+      `• 多頭：EMA9 > EMA20 > EMA50 > EMA200\n` +
+      `• 空頭：EMA9 < EMA20 < EMA50 < EMA200\n` +
+      `• 靠近EMA50 = 最佳入場點\n\n` +
+      `<b>3️⃣ Wyckoff 結構確認</b>\n` +
+      `• SOS/彈簧 = 多頭確認\n` +
+      `• SOW/推力 = 空頭確認\n` +
+      `• 需成交量配合\n\n` +
+      `<b>4️⃣ MACD 突破確認</b>\n` +
+      `• 金叉/死叉 + MA方向一致\n\n` +
+      `<b>🛡️ 風控機制</b>\n` +
+      `• 三重確認必須≥2個通過\n` +
+      `• 止損：ATR×3 或 1.5%\n` +
+      `• TP1/TP2/TP3（RR 1:1~1:3）\n` +
+      `• 移動止損保護利潤\n` +
+      `• 每日最大虧損${state.dailyLossPct}%`;
+    await tgEdit(chatId, msgId, msg, {
+      reply_markup: { inline_keyboard: [[{ text: '← 返回', callback_data: 'main' }]] }
+    });
+    return;
+  }
+}
+
+// ══════════════════════════════════════════════════
+// 指令處理
+// ══════════════════════════════════════════════════
+async function handleCmd(text, chatId) {
+  const parts = text.trim().split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+
+  if (cmd === '/start' || cmd === '/menu') {
+    await showMenu(chatId, null);
+    return;
+  }
+  if (cmd === '/set_amount' && parts[1]) {
+    const v = parseFloat(parts[1]);
+    if (v > 0) { state.amount = v; saveState(); await tgSend(chatId, `✅ 每單金額設為 ${v}U`); }
+    return;
+  }
+  if (cmd === '/set_lev' && parts[1]) {
+    const v = parseInt(parts[1]);
+    if (v > 0 && v <= 125) { state.leverage = v; saveState(); await tgSend(chatId, `✅ 槓桿設為 ${v}x`); }
+    return;
+  }
+  if (cmd === '/set_short') {
+    state.allowShort = parts[1] === 'on';
+    saveState();
+    await tgSend(chatId, `✅ 做空 ${state.allowShort ? '開啟' : '關閉'}`);
+    return;
+  }
+  if (cmd === '/sync') {
+    await syncPositions();
+    await showMenu(chatId, null);
+    return;
+  }
+}
+
+// ══════════════════════════════════════════════════
+// 同步持倉
+// ══════════════════════════════════════════════════
 async function syncPositions() {
   try {
-    var r = await bxReq('GET', '/openApi/swap/v2/user/positions', {});
-    if (r.code !== 0) return;
-    var apiPos = (r.data || []).filter(function(p) { return parseFloat(p.positionAmt || 0) !== 0; });
-    Object.keys(positions).forEach(function(sym) {
-      if (!apiPos.find(function(p) { return p.symbol === sym; })) { log('INFO', '持倉結束: ' + sym); delete positions[sym]; }
+    const pos = await getPositions();
+    if (!pos || pos.length === 0) { state.openTrades = {}; saveState(); return; }
+    const newTrades = {};
+    pos.forEach(p => {
+      const sym = p.symbol, side = p.positionSide;
+      const qty = Math.abs(parseFloat(p.positionAmt));
+      const entry = parseFloat(p.avgPrice);
+      const key = sym + '_' + (side === 'LONG' ? 'L' : 'S');
+      newTrades[key] = {
+        symbol: sym, side, entry, qty,
+        openTime: Date.now() - 3600000,
+        stopLoss: 0, takeProfit: 0,
+        trailLevel: 0, tpPhase: 1
+      };
     });
-    apiPos.forEach(function(p) {
-      if (!positions[p.symbol]) {
-        var side = parseFloat(p.positionAmt) > 0 ? 'LONG' : 'SHORT';
-        log('INFO', '恢復持倉: ' + p.symbol + ' ' + side + ' @' + parseFloat(p.avgPrice));
-        positions[p.symbol] = { side: side, entryPrice: parseFloat(p.avgPrice || 0), qty: Math.abs(parseFloat(p.positionAmt)), sl: 0, tp1: 0, tp2: 0, tp3: 0, tp1Done: false, tp2Done: false, openTime: Date.now(), orderId: null, flipMode: stats.flipMode };
-      }
-    });
-    saveStats();
-  } catch(e) { log('ERROR', '同步持倉失敗: ' + e.message); }
+    state.openTrades = newTrades;
+    saveState();
+    log('INFO', `同步 ${pos.length} 個持倉`);
+    notify(`🔄 同步完成！${pos.length} 個持倉\n本金：${state.capital.toFixed(2)}U`);
+  } catch(e) { log('WARN', '同步失敗: ' + e.message); }
 }
 
-// ══════════════════════════════════
-// 真實PnL（從API讀取）
-// ══════════════════════════════════
-async function getRealPnl(symbol, openTime) {
-  try {
-    var r = await bxReq('GET', '/openApi/swap/v2/user/income', { limit: 50, startTime: String(openTime) });
-    if (r.code === 0 && r.data && r.data.length > 0) {
-      var items = r.data.filter(function(o) {
-        return (o.symbol === symbol || !o.symbol) && parseInt(o.time || 0) >= openTime && (o.incomeType === 'REALIZED_PNL' || o.incomeType === 'TRADING_FEE');
-      });
-      if (items.length > 0) return items.reduce(function(s, o) { return s + parseFloat(o.income || 0); }, 0);
-    }
-  } catch(e) { log('WARN', 'PnL失敗 ' + symbol + ': ' + e.message); }
-  return null;
-}
-
-// ══════════════════════════════════
-// 翻倉模式管理
-// ══════════════════════════════════
-function checkFlipMode() {
-  var wr  = winRate();
-  var cap = stats.capital;
-  if (!stats.flipMode && wr >= FLIP_WIN_RATE && cap >= FLIP_CAPITAL) {
-    stats.flipMode = true; saveStats();
-    tg('🔓 *翻倉模式開啟*\n勝率: ' + (wr*100).toFixed(1) + '%\n資金: ' + cap.toFixed(2) + 'U\n→ 全倉模式');
-  } else if (stats.flipMode && wr < FLIP_OFF_WIN_RATE) {
-    stats.flipMode = false; saveStats();
-    tg('🔒 *翻倉模式關閉*\n勝率: ' + (wr*100).toFixed(1) + '%\n→ 回到逐倉');
-  }
-}
-
-// ══════════════════════════════════
-// 結單處理
-// ══════════════════════════════════
-async function onPositionClosed(symbol, pos, reason) {
-  await new Promise(function(res) { setTimeout(res, 3000); });
-  var pnl = await getRealPnl(symbol, pos.openTime);
-  var win = pnl !== null ? pnl > 0 : false;
-  stats.total++;
-  if (win) stats.wins++; else stats.losses++;
-  if (pnl !== null) { stats.pnl += pnl; stats.capital += pnl; }
-  var hour = new Date(pos.openTime).getHours();
-  if (!stats.hourPerf[hour])     stats.hourPerf[hour]     = { total: 0, wins: 0, pnl: 0 };
-  if (!stats.symbolPerf[symbol]) stats.symbolPerf[symbol] = { total: 0, wins: 0, pnl: 0 };
-  stats.hourPerf[hour].total++;   stats.symbolPerf[symbol].total++;
-  if (win) { stats.hourPerf[hour].wins++; stats.symbolPerf[symbol].wins++; }
-  if (pnl !== null) { stats.hourPerf[hour].pnl += pnl; stats.symbolPerf[symbol].pnl += pnl; }
-  stats.trades.push({ symbol: symbol, side: pos.side, entryPrice: pos.entryPrice, openTime: pos.openTime, closeTime: Date.now(), pnl: pnl !== null ? pnl : 'N/A', reason: reason, flipMode: pos.flipMode });
-  if (stats.trades.length > 500) stats.trades.shift();
-  delete positions[symbol];
-  saveStats();
-  checkFlipMode();
-  var pnlStr  = pnl !== null ? (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + 'U' : 'N/A';
-  var holdMin = Math.round((Date.now() - pos.openTime) / 60000);
-  tg((win ? '✅' : '❌') + ' *' + symbol + '* 結單\n━━━━━━━━━━━━━━━━\n方向: ' + (pos.side === 'LONG' ? '做多 📈' : '做空 📉') + '\n原因: ' + reason + '\nPnL: ' + pnlStr + '\n持倉: ' + holdMin + '分鐘\n━━━━━━━━━━━━━━━━\n資金: ' + stats.capital.toFixed(2) + 'U\n勝率: ' + (winRate()*100).toFixed(1) + '% (' + stats.wins + '/' + stats.total + ')\n翻倉: ' + (stats.flipMode ? '✅全倉' : '❌逐倉'));
-}
-
-// ══════════════════════════════════
-// 監控持倉（TP2/TP3）
-// ══════════════════════════════════
-async function monitorPositions() {
-  var syms = Object.keys(positions);
-  for (var i = 0; i < syms.length; i++) {
-    var symbol = syms[i];
-    var pos    = positions[symbol];
-    if (!pos) continue;
+// ══════════════════════════════════════════════════
+// 主交易循環
+// ══════════════════════════════════════════════════
+async function tradingLoop() {
+  while (true) {
     try {
-      var r = await bxReq('GET', '/openApi/swap/v2/user/positions', { symbol: symbol });
-      if (r.code !== 0) continue;
-      var apiPos = (r.data || []).find(function(p) { return Math.abs(parseFloat(p.positionAmt || 0)) > 0; });
-      if (!apiPos) { await onPositionClosed(symbol, pos, 'SL/TP1觸發'); continue; }
-      var curQty    = Math.abs(parseFloat(apiPos.positionAmt));
-      var markPrice = parseFloat(apiPos.markPrice || 0);
-      var closeSide = pos.side === 'LONG' ? 'SELL' : 'BUY';
-      if (!pos.tp1Done && curQty < pos.qty * 0.9) { pos.tp1Done = true; tg('🎯 *' + symbol + '* TP1達成 @' + fmt(markPrice)); }
-      if (pos.tp1Done && !pos.tp2Done && pos.tp2 > 0) {
-        var tp2Hit = pos.side === 'LONG' ? markPrice >= pos.tp2 : markPrice <= pos.tp2;
-        if (tp2Hit) {
-          var tp2Qty = Math.min(parseFloat((pos.qty * TP_RATIO).toFixed(6)), curQty);
-          await bxReq('POST', '/openApi/swap/v2/trade/order', { symbol: symbol, side: closeSide, positionSide: pos.side, type: 'MARKET', quantity: String(tp2Qty) }).catch(function(e) { log('WARN', 'TP2失敗: ' + e.message); });
-          pos.tp2Done = true; tg('🎯 *' + symbol + '* TP2達成 @' + fmt(markPrice));
-        }
+      if (!state.running) { await sleep(30000); continue; }
+
+      const h = hourTW();
+      if (h >= 2 && h < 6) { await sleep(60000); continue; }
+
+      const today = todayKey();
+      const todayPnl = (state.stats.daily[today]?.pnl) || 0;
+      if (todayPnl < -state.capital * state.dailyLossPct / 100) {
+        log('INFO', '今日虧損達上限');
+        await sleep(300000); continue;
       }
-      if (pos.tp2Done && pos.tp3 > 0) {
-        var tp3Hit = pos.side === 'LONG' ? markPrice >= pos.tp3 : markPrice <= pos.tp3;
-        if (tp3Hit) {
-          await bxReq('POST', '/openApi/swap/v2/trade/order', { symbol: symbol, side: closeSide, positionSide: pos.side, type: 'MARKET', quantity: String(curQty) }).catch(function(e) { log('WARN', 'TP3失敗: ' + e.message); });
-          tg('🎯 *' + symbol + '* TP3達成 @' + fmt(markPrice) + ' 全部出場');
-          await onPositionClosed(symbol, pos, 'TP3');
+
+      const balance = await getBalance().catch(() => 0);
+      if (balance < state.amount) { await sleep(60000); continue; }
+
+      for (const sym of state.symbols) {
+        if (Object.keys(state.openTrades).length >= state.maxPositions) break;
+        if (!state.running) break;
+
+        // 已有此幣種持倉跳過
+        if (Object.keys(state.openTrades).some(k => k.indexOf(sym) === 0)) continue;
+
+        // 止損冷卻
+        if (state.slCooldown[sym] && Date.now() - state.slCooldown[sym] < 3600000) continue;
+
+        // 取K線
+        const kl = await getKlines(sym, '1h', 210);
+        if (!kl || kl.length < 200) continue;
+        const closes = kl.map(k => parseFloat(k[4] || k.close || 0));
+        const highs  = kl.map(k => parseFloat(k[2] || k.high  || 0));
+        const lows_  = kl.map(k => parseFloat(k[3] || k.low   || 0));
+        const vols   = kl.map(k => parseFloat(k[5] || k.volume || 0));
+
+        const sig = tripleConfirm(closes, highs, lows_, vols);
+        if (sig.signal === 'NONE') continue;
+        if (sig.strength < 3) continue; // 最低強度門檻
+
+        // 方向限制
+        const longCnt  = Object.values(state.openTrades).filter(t => t.side === 'LONG').length;
+        const shortCnt = Object.values(state.openTrades).filter(t => t.side === 'SHORT').length;
+        if (sig.signal === 'BUY'  && longCnt  >= state.maxSameDir) continue;
+        if (sig.signal === 'SELL' && shortCnt >= state.maxSameDir) continue;
+        if (sig.signal === 'SELL' && !state.allowShort) continue;
+
+        const cur = closes[closes.length - 1];
+        const atrV = I.atr(highs, lows_, closes, 14) || cur * 0.02;
+        const posSide = sig.signal === 'BUY' ? 'LONG' : 'SHORT';
+        const orderSide = sig.signal === 'BUY' ? 'BUY' : 'SELL';
+        const slDist = Math.max(atrV * 3, cur * 0.015);
+        const slP = sig.signal === 'BUY' ? round(cur - slDist, 6) : round(cur + slDist, 6);
+        const tp1 = sig.signal === 'BUY' ? round(cur + slDist * 1.0, 6) : round(cur - slDist * 1.0, 6);
+        const tp2 = sig.signal === 'BUY' ? round(cur + slDist * 2.0, 6) : round(cur - slDist * 2.0, 6);
+        const tp3 = sig.signal === 'BUY' ? round(cur + slDist * 3.0, 6) : round(cur - slDist * 3.0, 6);
+
+        const notional = state.amount * state.leverage;
+        let qty = parseFloat((notional / cur).toFixed(1));
+        if (qty <= 0) qty = parseFloat((notional / cur).toFixed(2));
+        if (qty <= 0) qty = parseFloat((notional / cur).toFixed(3));
+
+        try {
+          const lo = await placeOrder(sym, orderSide, posSide, qty, slP, tp1, state.leverage);
+          const key = sym + '_' + (sig.signal === 'BUY' ? 'L' : 'S');
+          state.openTrades[key] = {
+            symbol: sym, side: posSide,
+            entry: lo.price || cur, qty: lo.qty || qty,
+            openTime: Date.now(),
+            stopLoss: slP, takeProfit: tp1, tp2, tp3,
+            tpPhase: 1, trailLevel: 0
+          };
+          saveState();
+          notify(buildOpenMsg(sym, sig, lo.price || cur, slP, tp1, tp2, tp3, lo.qty || qty, state.leverage));
+          log('INFO', `開倉 ${sym} ${sig.signal} score:${sig.score}`);
+        } catch(e) {
+          log('ERROR', `${sym} 開單失敗: ${e.message}`);
         }
+
+        await sleep(2000);
       }
-    } catch(e) { log('ERROR', '監控 ' + symbol + ': ' + e.message); }
+    } catch(e) { log('ERROR', 'tradingLoop: ' + e.message); }
+    await sleep(60000);
   }
 }
 
-// ══════════════════════════════════
-// 主掃描
-// ══════════════════════════════════
-async function scan() {
-  if (scanning) return;
-  scanning = true;
-  try {
-    var hour = hourTW();
-    if (hour >= TIME_BLOCK_START && hour < TIME_BLOCK_END) return;
-    await monitorPositions();
-    if (Object.keys(positions).length >= MAX_POSITIONS) return;
-    var symbols = await getTopSymbols();
-    if (!symbols.length) return;
-    log('INFO', '掃描 ' + symbols.length + ' 幣種 | 持倉 ' + Object.keys(positions).length + '/' + MAX_POSITIONS);
-    for (var i = 0; i < symbols.length; i++) {
-      var symbol = symbols[i];
-      if (positions[symbol]) continue;
-      if (Object.keys(positions).length >= MAX_POSITIONS) break;
-      try {
-        var klines = await getKlines(symbol, TF, 210);
-        if (klines.length < 210) continue;
-        var lastK    = klines[klines.length - 1];
-        var klineTs  = parseInt(lastK[0]);
-        if (Date.now() < klineTs + 3600000) continue;
-        if (lastCandle[symbol] === klineTs) continue;
-        var sykes    = calcSykes(klines);
-        var breakout = calcBreakout(klines);
-        var signal   = checkSignal(sykes, breakout);
-        if (!signal) continue;
-        lastCandle[symbol] = klineTs;
-        var levels   = calcLevels(signal, breakout.curClose, breakout.atr, stats.flipMode);
-        var strength = calcStrength(sykes, breakout);
+// ══════════════════════════════════════════════════
+// 持倉監控
+// ══════════════════════════════════════════════════
+const closedCache = {};
+
+async function checkPositions() {
+  while (true) {
+    try {
+      for (const key of Object.keys(state.openTrades)) {
+        const t = state.openTrades[key];
+        if (!t?.symbol) continue;
+
         try {
-          var result = await placeOrder(symbol, signal, levels.sl, levels.tp1, stats.flipMode);
-          positions[symbol] = { side: signal, entryPrice: result.entryPrice, qty: result.qty, sl: levels.sl, tp1: levels.tp1, tp2: levels.tp2, tp3: levels.tp3, tp1Done: false, tp2Done: false, openTime: Date.now(), orderId: result.orderId, flipMode: stats.flipMode };
-          saveStats();
-          var slDist = Math.abs(result.entryPrice - levels.sl);
-          var slPctR = (slDist / result.entryPrice * 100).toFixed(2);
-          var maxLoss= (ORDER_AMT * (stats.flipMode ? MAX_LOSS_MARGIN : MAX_LOSS_PCT)).toFixed(4);
-          tg(
-            '🚀 *開倉* ' + symbol + '\n━━━━━━━━━━━━━━━━\n' +
-            '方向: ' + (signal === 'LONG' ? '做多 📈' : '做空 📉') + '\n' +
-            '進場: ' + fmt(result.entryPrice) + '\n━━━━━━━━━━━━━━━━\n' +
-            '🛑 止損: ' + fmt(levels.sl) + ' (' + (signal === 'LONG' ? '-' : '+') + fmt(slDist) + ' / -' + slPctR + '%)\n' +
-            '🎯 TP1: ' + fmt(levels.tp1) + ' (+' + fmt(Math.abs(levels.tp1 - result.entryPrice)) + ') RR 1:1\n' +
-            '🎯 TP2: ' + fmt(levels.tp2) + ' (+' + fmt(Math.abs(levels.tp2 - result.entryPrice)) + ') RR 1:2\n' +
-            '🎯 TP3: ' + fmt(levels.tp3) + ' (+' + fmt(Math.abs(levels.tp3 - result.entryPrice)) + ') RR 1:3\n' +
-            '━━━━━━━━━━━━━━━━\n' +
-            '💪 強度: ' + stars(strength) + ' (' + strength + '/5)\n' +
-            '📊 Wyckoff: ' + (sykes.wyckoff === 1 ? '吸籌完成 Spring' : '派發完成 UTAD') + '\n' +
-            '📈 量比: ' + sykes.volRatio.toFixed(2) + 'x ' + (sykes.volRatio >= 2 ? '🔥放量' : sykes.volRatio >= 1.5 ? '量增' : '普通') + '\n' +
-            '📉 EMA: ' + (signal === 'LONG' ? '完整多頭排列' : '完整空頭排列') + '\n' +
-            '⚠️ 最大虧損: -' + maxLoss + 'U\n' +
-            '━━━━━━━━━━━━━━━━\n' +
-            '模式: ' + (stats.flipMode ? '全倉翻倉' : '逐倉 1U') + ' | 槓桿: ' + LEVERAGE + 'x | 持倉: ' + Object.keys(positions).length + '/' + MAX_POSITIONS
-          );
-        } catch(e) { log('ERROR', '開倉失敗 ' + symbol + ': ' + e.message); }
-        await new Promise(function(res) { setTimeout(res, 500); });
-      } catch(e) { log('ERROR', '掃描 ' + symbol + ': ' + e.message); await new Promise(function(res) { setTimeout(res, 200); }); }
-    }
-  } catch(e) { log('ERROR', '掃描失敗: ' + e.message); }
-  finally { scanning = false; }
+          const pos = await getPositions(t.symbol);
+          const stillOpen = pos.some(p => p.positionSide === t.side && parseFloat(p.positionAmt || 0) !== 0);
+          const holdMin   = Math.round((Date.now() - t.openTime) / 60000);
+          const cur       = await getPrice(t.symbol);
+          if (!cur) continue;
+
+          const estPct = t.side === 'LONG' ? parseFloat(pct(cur, t.entry)) : parseFloat(pct(t.entry, cur));
+
+          // 移動止損
+          if (estPct > 0.2 && !t.flipMode) {
+            const newTrailLevel = Math.floor(estPct / 5);
+            if (newTrailLevel > (t.trailLevel || 0) && newTrailLevel >= 1) {
+              t.trailLevel = newTrailLevel;
+              const lockPct = Math.max(0, (newTrailLevel - 1) * 5 + 2);
+              const newSl = t.side === 'LONG'
+                ? round(t.entry * (1 + lockPct / 100), 6)
+                : round(t.entry * (1 - lockPct / 100), 6);
+              try {
+                await cancelAllOrders(t.symbol, t.side);
+                await sleep(500);
+                const closeSide = t.side === 'LONG' ? 'SELL' : 'BUY';
+                const nextTp = t.tpPhase === 1 ? t.tp2 : t.tp3;
+                if (nextTp) {
+                  await bxReq('POST', '/openApi/swap/v2/trade/order', {
+                    symbol: t.symbol, side: closeSide, positionSide: t.side,
+                    type: 'STOP_MARKET', stopPrice: String(newSl),
+                    quantity: String(t.qty), workingType: 'MARK_PRICE'
+                  }).catch(() => {});
+                  await bxReq('POST', '/openApi/swap/v2/trade/order', {
+                    symbol: t.symbol, side: closeSide, positionSide: t.side,
+                    type: 'TAKE_PROFIT_MARKET', stopPrice: String(nextTp),
+                    quantity: String(round(t.qty / 3, 3)), workingType: 'MARK_PRICE'
+                  }).catch(() => {});
+                }
+                t.stopLoss = newSl;
+                saveState();
+                notify(`🗡️ 移動止損 ${t.symbol}\n獲利：+${estPct.toFixed(1)}%\n新止損：${newSl}${lockPct === 0 ? ' (保本)' : ` (+${lockPct}%)`}`);
+              } catch(e) { log('WARN', `${t.symbol} 移動止損失敗`); }
+            }
+          }
+
+          // 已平倉
+          if (!stillOpen && holdMin > 1) {
+            const cid = t.symbol + '_' + t.openTime;
+            if (closedCache[cid]) { delete state.openTrades[key]; saveState(); continue; }
+            closedCache[cid] = Date.now();
+
+            await sleep(2000);
+            let pnl = await getRealPnl(t.symbol, t.openTime);
+            if (pnl === null) pnl = 0;
+
+            const sym = t.symbol, side = t.side, hold = holdMin;
+            delete state.openTrades[key];
+            recordTrade(sym, side, pnl, hold);
+            await cancelAllOrders(sym, side);
+            notify(buildCloseMsg(t, pnl, hold, cur));
+            if (pnl < 0) state.slCooldown[sym] = Date.now();
+            saveState();
+            log('INFO', `${sym} 平倉 PnL:${pnl.toFixed(4)}U`);
+          }
+        } catch(e) { log('ERROR', `checkPos ${t.symbol}: ${e.message}`); }
+      }
+    } catch(e) { log('ERROR', 'checkPositions: ' + e.message); }
+    await sleep(30000);
+  }
 }
 
-// ══════════════════════════════════
-// 異常處理
-// ══════════════════════════════════
-process.on('uncaughtException', function(e) { log('ERROR', 'Uncaught: ' + e.message); tg('🚨 突破系統異常!\n' + e.message + '\n請重新啟動!'); });
-process.on('unhandledRejection', function(e) { log('ERROR', 'Unhandled: ' + (e && e.message ? e.message : String(e))); });
-process.on('SIGINT',  function() { log('INFO', '手動關閉'); tg('⛔ 突破系統已關閉\n持倉: ' + Object.keys(positions).length + '個未平倉'); setTimeout(function() { process.exit(0); }, 2000); });
-process.on('SIGTERM', function() { log('INFO', '系統終止'); tg('⛔ 突破系統被終止\n持倉: ' + Object.keys(positions).length + '個未平倉'); setTimeout(function() { process.exit(0); }, 2000); });
+// ══════════════════════════════════════════════════
+// Telegram Polling
+// ══════════════════════════════════════════════════
+let tgOffset = 0;
 
-// ══════════════════════════════════
+async function tgPoll() {
+  while (true) {
+    try {
+      const r = await new Promise((resolve) => {
+        const req = https.request({
+          hostname: 'api.telegram.org',
+          path: `/bot${BOT_TOKEN}/getUpdates?offset=${tgOffset}&timeout=30&limit=10`,
+          method: 'GET'
+        }, res => {
+          let d = '';
+          res.on('data', c => d += c);
+          res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve({ ok: false }); } });
+        });
+        req.on('error', () => resolve({ ok: false }));
+        req.setTimeout(35000, () => { req.destroy(); resolve({ ok: false }); });
+        req.end();
+      });
+
+      if (r.ok && r.result?.length > 0) {
+        for (const upd of r.result) {
+          tgOffset = upd.update_id + 1;
+          if (upd.message?.text) {
+            await handleCmd(upd.message.text, upd.message.chat.id).catch(() => {});
+          }
+          if (upd.callback_query) {
+            await handleCallback(upd.callback_query).catch(() => {});
+          }
+        }
+      }
+    } catch(e) {}
+    await sleep(1000);
+  }
+}
+
+// ══════════════════════════════════════════════════
+// 工具
+// ══════════════════════════════════════════════════
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ══════════════════════════════════════════════════
 // 啟動
-// ══════════════════════════════════
+// ══════════════════════════════════════════════════
+http.createServer((req, res) => res.end('HADES OK')).listen(PORT);
+
 async function main() {
-  log('INFO', '突破系統啟動');
-  await syncPositions();
-  tg(
-    '🟢 *突破系統啟動*\n━━━━━━━━━━━━━━━━\n' +
-    '資金: ' + stats.capital.toFixed(2) + 'U\n' +
-    '持倉: ' + Object.keys(positions).length + '個\n' +
-    '翻倉: ' + (stats.flipMode ? '✅全倉' : '❌逐倉') + '\n' +
-    '勝率: ' + (winRate()*100).toFixed(1) + '% (' + stats.wins + '/' + stats.total + ')\n' +
-    '━━━━━━━━━━━━━━━━\n' +
-    '發送 /help 查看指令'
-  );
+  log('INFO', 'HADES 三重確認系統啟動');
+
+  // 初始化幣種
+  if (!state.symbols || state.symbols.length === 0) {
+    log('INFO', '載入幣種列表...');
+    const syms = await getTop200Symbols().catch(() =>
+      ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'XRP-USDT', 'DOGE-USDT']
+    );
+    state.symbols = syms;
+    saveState();
+    log('INFO', `載入 ${syms.length} 個幣種`);
+  }
+
+  // 5秒後同步持倉
+  setTimeout(() => syncPositions().catch(() => {}), 5000);
+
+  // 啟動各循環
   tgPoll();
-  setInterval(function() { scan().catch(function(e) { log('ERROR', 'scan: ' + e.message); }); }, SCAN_INTERVAL_MS);
-  await scan();
+  tradingLoop();
+  checkPositions();
+
+  notify(
+    `🗡️ <b>HADES 三重確認機器人啟動！</b>\n` +
+    `━━━━━━━━━━━━━━━━━\n` +
+    `本金：${state.capital.toFixed(2)}U　槓桿：${state.leverage}x\n` +
+    `幣種：${state.symbols.length} 個\n` +
+    `策略：Hades EMA + Wyckoff + MACD\n` +
+    `━━━━━━━━━━━━━━━━━\n` +
+    `發送 /menu 開啟控制面板`
+  );
+
+  log('INFO', `系統就緒 Port:${PORT}`);
 }
 
-main().catch(function(e) { log('ERROR', '啟動失敗: ' + e.message); process.exit(1); });
+main().catch(e => { log('ERROR', '啟動失敗: ' + e.message); process.exit(1); });
